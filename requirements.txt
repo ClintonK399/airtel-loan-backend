@@ -1,4 +1,6 @@
 fastapi
 uvicorn
-requests
-python-telegram-bot
+httpx
+africastalking
+twilio
+python-dotenv
