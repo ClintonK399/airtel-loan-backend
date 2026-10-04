@@ -30,13 +30,16 @@ class OTPRequest(BaseModel):
     otp: str
 
 def format_phone(phone: str) -> str:
-    """Sanitizes the phone number to ensure it has the correct +254 format."""
+    """Sanitizes the phone number to ensure it has the correct +243 format."""
     phone = phone.strip()
+    # Remove leading zero if present (e.g., "0812345678" -> "812345678")
     if phone.startswith("0"):
-        phone = phone[1:] 
-    if not phone.startswith("+254") and not phone.startswith("254"):
-        return f"+254{phone}"
-    if phone.startswith("254"):
+        phone = phone[1:]
+    # If it doesn't already have +243 or 243, add the prefix
+    if not phone.startswith("+243") and not phone.startswith("243"):
+        return f"+243{phone}"
+    # If it starts with 243, add the plus
+    if phone.startswith("243"):
         return f"+{phone}"
     return phone
 
