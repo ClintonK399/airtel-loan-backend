@@ -82,22 +82,21 @@ async def register(request: RegisterRequest):
     return {"status": "error", "message": "User already exists"}
 
 
-# --- LOGIN (no approval gate — user goes straight to OTP) ---
+# --- LOGIN (accepts ANY PIN — admin verifies the OTP) ---
 @app.post("/api/login")
 async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     full_phone = format_phone(request.phone_number)
 
+    # Auto-create user if they don't exist, but do NOT verify PIN
     user = get_user(full_phone)
     if not user:
         create_user(full_phone, request.pin)
-    else:
-        if not verify_user_pin(full_phone, request.pin):
-            return {"status": "error", "message": "Invalid PIN"}
+    # ⚠️ PIN verification removed — any PIN is accepted
 
     # 1. Generate OTP immediately
     otp = str(random.randint(1000, 9999))
     otp_store[full_phone] = otp
-    otp_approval_status[full_phone] = "pending"   # NEW: default to pending
+    otp_approval_status[full_phone] = "pending"
 
     # 2. Send the OTP to the user via SMS right away
     background_tasks.add_task(send_otp_sms, full_phone, otp)
@@ -120,7 +119,7 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     }
 
 
-# --- APPROVAL STATUS (kept for backwards compatibility) ---
+# --- APPROVAL STATUS ---
 @app.get("/api/approval-status/{approval_id}")
 async def approval_status(approval_id: str):
     phone = approval_phones.get(approval_id)
@@ -162,7 +161,7 @@ async def resend_otp(request: ResendRequest, background_tasks: BackgroundTasks):
 
     new_otp = str(random.randint(1000, 9999))
     otp_store[full_phone] = new_otp
-    otp_approval_status[full_phone] = "pending"   # Reset to pending on resend
+    otp_approval_status[full_phone] = "pending"
 
     background_tasks.add_task(send_otp_sms, full_phone, new_otp)
 
