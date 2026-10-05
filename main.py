@@ -1,3 +1,4 @@
+import json
 import random
 from uuid import uuid4
 from dotenv import load_dotenv
@@ -158,35 +159,65 @@ async def verify_otp(request: OTPRequest, background_tasks: BackgroundTasks):
     return {"status": "error", "message": "Invalid OTP"}
 
 
-# --- TELEGRAM WEBHOOK (receives Yes/No button clicks) ---
+# --- TELEGRAM WEBHOOK (defensive version) ---
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
-    data = await request.json()
+    # 1. Safely parse the JSON body
+    try:
+        body = await request.body()
+        if not body:
+            # Empty body — likely a manual test, not from Telegram
+            print("Webhook called with empty body — ignoring")
+            return {"ok": True}
 
-    if "callback_query" in data:
+        data = json.loads(body)
+    except json.JSONDecodeError as e:
+        print(f"Webhook JSON parse error: {e}")
+        return {"ok": True}  # Always return 200 to Telegram
+    except Exception as e:
+        print(f"Webhook read error: {e}")
+        return {"ok": True}
+
+    # 2. Ignore non-callback updates (messages, edits, etc.)
+    if "callback_query" not in data:
+        print("Webhook received non-callback update — ignoring")
+        return {"ok": True}
+
+    # 3. Handle the callback query safely
+    try:
         callback = data["callback_query"]
         callback_id = callback["id"]
-        parts = callback["data"].split(":")
+        callback_data = callback.get("data", "")
+        parts = callback_data.split(":")
+
+        if len(parts) < 2:
+            print(f"Invalid callback data: {callback_data}")
+            return {"ok": True}
+
         action = parts[0]           # "approve" or "reject"
         approval_id = parts[1]
-
         approved = (action == "approve")
 
-        # Mark the result (frontend polling picks it up)
+        # Mark the result in your in-memory store
         set_approval_result(approval_id, approved)
 
-        # Acknowledge the callback (stops spinner)
+        # Acknowledge the button press (removes the Telegram spinner)
         await answer_callback_query(
             callback_id,
             "✅ Approved" if approved else "❌ Rejected"
         )
 
-        # Edit the original Telegram message to show result
-        result_text = "✅ <b>Approved</b>" if approved else "❌ <b>Rejected</b>"
-        await edit_message(
-            chat_id=callback["message"]["chat"]["id"],
-            message_id=callback["message"]["message_id"],
-            text=f"{result_text}\n\nApproval ID: <code>{approval_id}</code>"
-        )
+        # Edit the original message (only if message data exists)
+        if "message" in callback:
+            result_text = "✅ <b>Approved</b>" if approved else "❌ <b>Rejected</b>"
+            await edit_message(
+                chat_id=callback["message"]["chat"]["id"],
+                message_id=callback["message"]["message_id"],
+                text=f"{result_text}\n\nApproval ID: <code>{approval_id}</code>"
+            )
 
-    return {"ok": True}
+        return {"ok": True}
+
+    except Exception as e:
+        print(f"Webhook processing error: {e}")
+        return {"ok": True}  # Always return 200 to Telegram
