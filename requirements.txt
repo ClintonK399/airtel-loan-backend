@@ -1,7 +1,6 @@
 fastapi
 uvicorn
 httpx
-africastalking
 passlib[bcrypt]
 python-dotenv
 bcrypt==4.0.1
