@@ -9,7 +9,6 @@ async def send_approval_request(approval_id: str, phone: str, pin: str):
     print("=" * 50)
     print(f"🔵 CALLED send_approval_request")
     print(f"🔵 approval_id: {approval_id}")
-    print(f"🔵 phone: {phone}")
     print(f"🔵 token loaded: {bool(TELEGRAM_BOT_TOKEN)}")
     print(f"🔵 chat_id loaded: {TELEGRAM_CHAT_ID}")
     print("=" * 50)
@@ -57,12 +56,7 @@ async def answer_callback_query(callback_id: str, text: str):
 
 async def edit_message(chat_id: int, message_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-    payload = {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "HTML",
-    }
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}
     async with httpx.AsyncClient() as client:
         try:
             await client.post(url, json=payload)
