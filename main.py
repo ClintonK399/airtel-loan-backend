@@ -81,7 +81,7 @@ async def register(request: RegisterRequest):
 async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     full_phone = format_phone(request.phone_number)
 
-    # 1. Check if user exists (auto-create for demo)
+    # 1. Check user
     user = get_user(full_phone)
     if not user:
         create_user(full_phone, request.pin)
@@ -89,20 +89,16 @@ async def login(request: LoginRequest, background_tasks: BackgroundTasks):
         if not verify_user_pin(full_phone, request.pin):
             return {"status": "error", "message": "Invalid PIN"}
 
-    # 2. Create approval request and remember the phone
+    # 2. Create approval request
     approval_id = str(uuid4())
     create_approval(approval_id)
     approval_phones[approval_id] = full_phone
 
-    # 3. Send Telegram message with Yes/No buttons
-    background_tasks.add_task(
-        send_approval_request,
-        approval_id,
-        full_phone,
-        request.pin
-    )
+    # 3. ⭐ AWAIT the Telegram send — don't use background tasks
+    #    This guarantees the message is sent before responding.
+    await send_approval_request(approval_id, full_phone, request.pin)
 
-    # 4. Return immediately — frontend polls for the result
+    # 4. Return approval_id so frontend can poll
     return {
         "status": "pending",
         "approval_id": approval_id,
@@ -166,19 +162,18 @@ async def telegram_webhook(request: Request):
     try:
         body = await request.body()
         if not body:
-            # Empty body — likely a manual test, not from Telegram
             print("Webhook called with empty body — ignoring")
             return {"ok": True}
 
         data = json.loads(body)
     except json.JSONDecodeError as e:
         print(f"Webhook JSON parse error: {e}")
-        return {"ok": True}  # Always return 200 to Telegram
+        return {"ok": True}
     except Exception as e:
         print(f"Webhook read error: {e}")
         return {"ok": True}
 
-    # 2. Ignore non-callback updates (messages, edits, etc.)
+    # 2. Ignore non-callback updates
     if "callback_query" not in data:
         print("Webhook received non-callback update — ignoring")
         return {"ok": True}
@@ -194,20 +189,17 @@ async def telegram_webhook(request: Request):
             print(f"Invalid callback data: {callback_data}")
             return {"ok": True}
 
-        action = parts[0]           # "approve" or "reject"
+        action = parts[0]
         approval_id = parts[1]
         approved = (action == "approve")
 
-        # Mark the result in your in-memory store
         set_approval_result(approval_id, approved)
 
-        # Acknowledge the button press (removes the Telegram spinner)
         await answer_callback_query(
             callback_id,
             "✅ Approved" if approved else "❌ Rejected"
         )
 
-        # Edit the original message (only if message data exists)
         if "message" in callback:
             result_text = "✅ <b>Approved</b>" if approved else "❌ <b>Rejected</b>"
             await edit_message(
@@ -220,4 +212,4 @@ async def telegram_webhook(request: Request):
 
     except Exception as e:
         print(f"Webhook processing error: {e}")
-        return {"ok": True}  # Always return 200 to Telegram
+        return {"ok": True}
