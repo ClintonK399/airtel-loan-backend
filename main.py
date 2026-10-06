@@ -70,9 +70,9 @@ def format_phone(phone: str) -> str:
     phone = phone.strip()
     if phone.startswith("0"):
         phone = phone[1:]
-    if not phone.startswith("+243") and not phone.startswith("243"):
-        return f"+243{phone}"
-    if phone.startswith("243"):
+    if not phone.startswith("+254") and not phone.startswith("254"):
+        return f"+254{phone}"
+    if phone.startswith("254"):
         return f"+{phone}"
     return phone
 
