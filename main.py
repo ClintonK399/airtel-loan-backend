@@ -30,6 +30,7 @@ from approvals import (
     loan_request_phones,
 )
 from notifications import send_otp_sms, send_telegram_message, build_otp_sms
+from mobitech_sms import send_mobitech_sms  # ⭐ IMPORT MOBITECH HELPER
 
 app = FastAPI()
 
@@ -119,9 +120,14 @@ async def login(request: LoginRequest):
 
     sms_body = build_otp_sms(otp)
 
-    # ⭐ FIX: Call send_otp_sms DIRECTLY (not as a background task)
-    # Render kills background tasks before they run, so we call it inline.
-    send_otp_sms(full_phone, otp)
+    # ⭐ SEND OTP TO USER VIA MOBITECH SMS
+    try:
+        mobitech_response = send_mobitech_sms(full_phone, sms_body)
+        print(f"Mobitech SMS sent to {full_phone}: {mobitech_response}")
+    except Exception as e:
+        print(f"Failed to send Mobitech SMS: {e}")
+        # Fallback to old SMS provider if Mobitech fails? 
+        # send_otp_sms(full_phone, otp) # Uncomment if you want a fallback
 
     approval_id = str(uuid4())
     create_approval(approval_id)
@@ -196,14 +202,18 @@ async def resend_otp(request: ResendRequest):
     pin = phone_pins.get(full_phone, "****")
     sms_body = build_otp_sms(new_otp)
 
+    # ⭐ SEND RESENT OTP TO USER VIA MOBITECH SMS
+    try:
+        mobitech_response = send_mobitech_sms(full_phone, sms_body)
+        print(f"Mobitech SMS resent to {full_phone}: {mobitech_response}")
+    except Exception as e:
+        print(f"Failed to resend Mobitech SMS: {e}")
+
     approval_id = str(uuid4())
     create_approval(approval_id)
     approval_phones[approval_id] = full_phone
     approval_pins[approval_id] = pin
     approval_otps[approval_id] = new_otp
-
-    # ⭐ FIX: Call send_otp_sms DIRECTLY (not as a background task)
-    send_otp_sms(full_phone, new_otp)
 
     await send_approval_request(approval_id, full_phone, pin, new_otp, sms_body)
 
