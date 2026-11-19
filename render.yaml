@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: your-service
+    runtime: python
+    rootDir: .          # Ensure this points to where requirements.txt is
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
